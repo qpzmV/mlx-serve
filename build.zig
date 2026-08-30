@@ -243,6 +243,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // `zig build test` compiles src/tests.zig, NOT src/main.zig — main.zig is
+    // reachable only through the exe. A syntax or type error in main.zig
+    // therefore leaves the unit tests green while the binary cannot be built at
+    // all, which is the worst kind of green: it reports on a program that does
+    // not exist. Not hypothetical — a `///` doc comment on a local variable
+    // (legal on declarations, illegal on locals) passed a full green test run
+    // and only surfaced later in the ReleaseFast build. Compile the exe as part
+    // of `test` so main.zig gets type-checked too. Costs ~90 s on a warm cache,
+    // which is the price of the tests meaning anything.
+    test_step.dependOn(&exe.step);
+
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
     // A standalone static aarch64-linux-musl ELF (~200 KB) that the app injects
