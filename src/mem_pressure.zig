@@ -62,12 +62,32 @@ pub const PressureWatch = struct {
 
     pub fn defaultWatermarkBytes(total: u64) u64 {
         if (total == 0) return 0;
-        return @max(10 * GB, total / 8);
+        // The floor scales DOWN with the machine. A flat 10 GB floor is 62%
+        // of a 16 GB Mac's RAM — i.e. a perfectly healthy machine — so the
+        // guard would exit a small Mac that is doing nothing wrong, and do it
+        // by default. Cap the floor at a quarter of RAM and take whichever of
+        // that and RAM/8 is larger:
+        //   128 GB -> 16 GB (RAM/8 wins)     32 GB ->  8 GB (RAM/4 wins)
+        //    16 GB ->  4 GB (RAM/4 wins)     64 GB -> 10 GB (floor wins)
+        return @max(@min(10 * GB, total / 4), total / 8);
     }
 
     pub fn defaultHysteresisBytes(total: u64) u64 {
         if (total == 0) return 0;
-        return @max(2 * GB, total / 64);
+        // Same shape as the watermark floor: a flat 2 GB band is 12% of a
+        // 16 GB Mac's RAM, which is not hysteresis, it is a second bar.
+        return @max(@min(2 * GB, total / 32), total / 64);
+    }
+
+    /// True when a real reading is due. A pure time check on `const self` —
+    /// callers use it to skip the RAM read (a syscall, or a file read + an
+    /// allocation in probe mode) entirely on the wakes in between, so the
+    /// 500 ms poll never touches memory. `tick` keeps its own throttle so the
+    /// state machine is correct on its own; this just avoids paying for a
+    /// reading that is about to be thrown away.
+    pub fn checkDue(self: *const PressureWatch, now_ms: i64) bool {
+        if (self.last_check) |last| return now_ms - last >= self.check_interval_ms;
+        return true;
     }
 
     /// The current available-RAM reading: probe file (GB, float) when set,
@@ -182,12 +202,35 @@ test "unknown availability (maxInt) is no information: it neither starts nor res
     try t.expectEqual(@as(Action, .exit), w.tick(11_000, 9 * GBf));
 }
 
-test "defaults are per-machine: max(10 GB, RAM/8) and max(2 GB, RAM/64)" {
+test "defaults scale with the machine: floor capped at RAM/4, bar at RAM/8" {
     try t.expectEqual(@as(u64, 0), PressureWatch.defaultWatermarkBytes(0));
-    try t.expectEqual(10 * GBf, PressureWatch.defaultWatermarkBytes(16 * GBf)); // 16/8=2 < 10 → floor
-    try t.expectEqual(16 * GBf, PressureWatch.defaultWatermarkBytes(128 * GBf)); // 128/8=16 → scale
+    // Small machines: the floor MUST come down with them. A flat 10 GB floor
+    // is 62% of a 16 GB Mac's RAM — a healthy machine — so the default guard
+    // would sit above its own bar and exit it.
+    try t.expectEqual(4 * GBf, PressureWatch.defaultWatermarkBytes(16 * GBf)); // min(10, 4) = 4
+    try t.expectEqual(8 * GBf, PressureWatch.defaultWatermarkBytes(32 * GBf)); // min(10, 8) = 8
+    try t.expectEqual(10 * GBf, PressureWatch.defaultWatermarkBytes(64 * GBf)); // floor 10 vs 8 → 10
+    try t.expectEqual(16 * GBf, PressureWatch.defaultWatermarkBytes(128 * GBf)); // 128/8 = 16 wins
+    // Hysteresis follows the same shape: a 16 GB Mac gets a 512 MB band, not 2 GB.
     try t.expectEqual(2 * GBf, PressureWatch.defaultHysteresisBytes(128 * GBf));
     try t.expectEqual(4 * GBf, PressureWatch.defaultHysteresisBytes(256 * GBf));
+    try t.expectEqual(@as(u64, 512 * 1024 * 1024), PressureWatch.defaultHysteresisBytes(16 * GBf));
+}
+
+test "checkDue gates the RAM read and does not advance the clock itself" {
+    var w = PressureWatch{ .watermark_bytes = 10 * GBf, .check_interval_ms = 5_000 };
+    // No check has happened yet, so one is due (last_check is null).
+    try t.expect(w.checkDue(0));
+    _ = w.tick(0, 9 * GBf); // the real check that STARTS the clock
+    try t.expect(!w.checkDue(4_999)); // inside the interval → skip the read
+    try t.expect(w.checkDue(5_000)); // interval elapsed → read
+    // checkDue takes `*const self` and must not move last_check itself —
+    // otherwise the throttle would advance on every 500 ms poll and never
+    // actually throttle.
+    try t.expect(!w.checkDue(1));
+    _ = w.tick(10_000, 9 * GBf); // another real check advances it
+    try t.expect(!w.checkDue(10_001));
+    try t.expect(w.checkDue(15_000));
 }
 
 test "probe file: the injected number IS the reading; missing/garbage is unknown" {

@@ -408,6 +408,21 @@ pub fn parseInput(
     return pi;
 }
 
+/// Fold OpenAI's newer `developer` role onto `system` (Codex / o-series
+/// clients send developer-role instructions). Chat templates only know
+/// system/user/assistant/tool — an unmapped role reaches the Jinja renderer,
+/// trips `raise_exception('Unexpected message role.')` and degrades the whole
+/// request to the generic chat format.
+///
+/// ONE place, called by EVERY role entry point (input items in
+/// `appendMessageItem`, compaction-blob messages in
+/// `appendCompactionInputItem`, anything added later), so a new path cannot
+/// quietly reintroduce the raw role.
+fn normalizeRole(role: []const u8) []const u8 {
+    if (std.mem.eql(u8, role, "developer")) return "system";
+    return role;
+}
+
 fn appendMessageItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
@@ -417,13 +432,7 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    var role = role_val.string;
-    // OpenAI's newer spec renames `system` to `developer` (Codex / o-series
-    // clients send developer-role instructions). Chat templates only know
-    // system/user/assistant/tool — an unmapped role reaches the Jinja
-    // renderer, trips `raise_exception('Unexpected message role.')` and
-    // degrades the whole request to the generic chat format. Fold it back.
-    if (std.mem.eql(u8, role, "developer")) role = "system";
+    const role = normalizeRole(role_val.string);
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -477,6 +486,28 @@ fn appendMessageItem(
     }
 
     if (content.len == 0 and images == null) return;
+
+    // Codex (and the o-series clients) send BOTH `instructions` and a
+    // developer-role message. `parseInput` already turned `instructions` into
+    // the leading system message, so folding this one to `system` as well
+    // would append a SECOND system — and a NON-LEADING one, which is exactly
+    // the shape this function's own contract promises templates like Qwen's
+    // never see. Merge into the system that is already there instead.
+    // Skipped when the message carries images: a system message with vision
+    // content is not something to silently concatenate.
+    if (std.mem.eql(u8, role, "system") and images == null and
+        pi.messages.items.len > 0 and
+        std.mem.eql(u8, pi.messages.items[0].role, "system"))
+    {
+        const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{
+            pi.messages.items[0].content,
+            content,
+        });
+        try pi.owned_strings.append(allocator, merged);
+        pi.messages.items[0].content = merged;
+        return;
+    }
+
     try pi.messages.append(allocator, .{
         .role = role,
         .content = content,
@@ -592,8 +623,12 @@ fn appendCompactionInputItem(
         if (content_val != .string) continue;
 
         // Inner JSON values are owned by `parsed` (freed at scope end).
-        // Dupe both fields so they outlive this function.
-        const role_owned = try allocator.dupe(u8, role_val.string);
+        // Dupe both fields so they outlive this function. The role goes
+        // through `normalizeRole` like every other entry point: a blob can
+        // carry a `developer` role (it round-trips whatever the resolved
+        // messages said), and handing one straight to a chat template is the
+        // "Unexpected message role" failure all over again.
+        const role_owned = try allocator.dupe(u8, normalizeRole(role_val.string));
         try pi.owned_strings.append(allocator, role_owned);
         const content_owned = try allocator.dupe(u8, content_val.string);
         try pi.owned_strings.append(allocator, content_owned);
@@ -873,8 +908,13 @@ test "parseInput with instructions prepends system" {
 test "parseInput folds the developer role into system" {
     // Codex / o-series clients send `{"type":"message","role":"developer",...}`.
     // Chat templates raise on unknown roles, so it must arrive as `system`.
+    // NOTE: `parseInput` takes the *input value itself* (a string or an
+    // array), not the enclosing `{"input": ...}` request body. Passing the
+    // whole object silently falls through to the `else => {}` branch and
+    // yields zero messages — which is exactly how this test looked "green"
+    // while never having been compiled.
     const json =
-        \\{"input":[{"type":"message","role":"developer","content":"be terse"}]}
+        \\[{"type":"message","role":"developer","content":"be terse"}]
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
@@ -883,6 +923,24 @@ test "parseInput folds the developer role into system" {
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("system", pi.messages.items[0].role);
     try testing.expectEqualStrings("be terse", pi.messages.items[0].content);
+}
+
+test "parseInput merges a developer message into existing system instructions" {
+    // Codex sends BOTH `instructions` and a developer-role message. Folding
+    // the developer message to `system` naively would produce a SECOND,
+    // non-leading system message — the one shape chat templates choke on.
+    const json =
+        \\[{"type":"message","role":"developer","content":"be terse"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, "You are a pirate", null, null, .{});
+    defer pi.deinit();
+
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    // Fresh instructions first, developer text appended after a blank line.
+    try testing.expectEqualStrings("You are a pirate\n\nbe terse", pi.messages.items[0].content);
 }
 
 test "parseInput replaces stored system when fresh instructions are provided" {
