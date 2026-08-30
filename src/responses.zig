@@ -417,7 +417,13 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    const role = role_val.string;
+    var role = role_val.string;
+    // OpenAI's newer spec renames `system` to `developer` (Codex / o-series
+    // clients send developer-role instructions). Chat templates only know
+    // system/user/assistant/tool — an unmapped role reaches the Jinja
+    // renderer, trips `raise_exception('Unexpected message role.')` and
+    // degrades the whole request to the generic chat format. Fold it back.
+    if (std.mem.eql(u8, role, "developer")) role = "system";
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -862,6 +868,21 @@ test "parseInput with instructions prepends system" {
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
     try testing.expectEqualStrings("system", pi.messages.items[0].role);
     try testing.expectEqualStrings("user", pi.messages.items[1].role);
+}
+
+test "parseInput folds the developer role into system" {
+    // Codex / o-series clients send `{"type":"message","role":"developer",...}`.
+    // Chat templates raise on unknown roles, so it must arrive as `system`.
+    const json =
+        \\{"input":[{"type":"message","role":"developer","content":"be terse"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("be terse", pi.messages.items[0].content);
 }
 
 test "parseInput replaces stored system when fresh instructions are provided" {
