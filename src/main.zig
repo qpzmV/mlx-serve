@@ -298,8 +298,11 @@ fn printUsage(io: std.Io) void {
         \\                        idle for this many seconds. Default: off.
         \\  --memory-pressure <n>{{KB,MB,GB}}|auto|off
         \\                      Machine-wide available-RAM guard. Default
-        \\                        'auto' = max(10 GB, RAM/8) — 16 GB on a
-        \\                        128 GB Mac. While available RAM sits under
+        \\                        'auto' = max(min(10 GB, RAM/4), RAM/8) —
+        \\                        16 GB on a 128 GB Mac, 8 GB on 32 GB, 4 GB
+        \\                        on 16 GB (the floor scales down with the
+        \\                        machine so a small Mac is not guarded to
+        \\                        death). While available RAM sits under
         \\                        the watermark the guard evicts one idle
         \\                        resident model; sustained pressure exits
         \\                        the process cleanly (code 0) so the RAM is
@@ -308,7 +311,15 @@ fn printUsage(io: std.Io) void {
         \\  --memory-pressure-exit-after <ms>
         \\                      Sustained-pressure milliseconds before the
         \\                        clean exit(0). Default: 30000. 0 = evict
-        \\                        only, never exit.
+        \\                        only, never exit. Granularity is the check
+        \\                        interval below, so a value under it exits on
+        \\                        the next check, not sooner.
+        \\  --memory-pressure-check-interval <ms>
+        \\                      How often the watchdog takes a real RAM
+        \\                        reading. Default: 5000. The thread still
+        \\                        wakes every 500 ms to poll its stop flag but
+        \\                        reads nothing between checks. Lower it to
+        \\                        make the exit countdown more responsive.
         \\  --metrics           Enable Prometheus metrics at GET /metrics and a
         \\                        live metrics panel on the index page (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
@@ -506,6 +517,12 @@ pub fn main(init: std.process.Init) !void {
     // off, n = explicit watermark bytes. Exit countdown default 30 s.
     var mem_pressure_arg: ?u64 = null;
     var mem_pressure_exit_after_ms: i64 = 30_000;
+    // How often the watchdog takes a REAL reading (RAM read or probe read).
+    // The thread still wakes every 500 ms to poll its stop flag, but it does
+    // not touch memory between intervals. Also the resolution of the exit
+    // countdown: an `exit_after_ms` below this is meaningless, so it is
+    // exposed rather than hard-coded.
+    var mem_pressure_check_interval_ms: i64 = 5_000;
     var metrics_enabled = false;
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
@@ -840,6 +857,24 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--memory-pressure-exit-after: expected milliseconds; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            // A negative value would silently disable the exit (tick only
+            // fires when `exit_after_ms > 0`), and 0 is the documented
+            // "evict-only" opt-out — so reject the former loudly and explain
+            // the latter in the log rather than printing "exit after 0 s".
+            if (mem_pressure_exit_after_ms < 0) {
+                log.err("--memory-pressure-exit-after: must be >= 0 (0 = evict only, never exit); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, args[i], "--memory-pressure-check-interval") and i + 1 < args.len) {
+            i += 1;
+            mem_pressure_check_interval_ms = std.fmt.parseInt(i64, args[i], 10) catch {
+                log.err("--memory-pressure-check-interval: expected milliseconds; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            if (mem_pressure_check_interval_ms < 100) {
+                log.err("--memory-pressure-check-interval: must be >= 100 ms; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
@@ -1049,10 +1084,17 @@ pub fn main(init: std.process.Init) !void {
             .watermark_bytes = watermark,
             .hysteresis_bytes = hysteresis,
             .exit_after_ms = mem_pressure_exit_after_ms,
+            .check_interval_ms = mem_pressure_check_interval_ms,
             .probe_file = if (probe_env) |p| std.mem.span(p) else null,
         };
-        defer server_mod.g_mem_pressure = null;
     }
+    // NOTE: this defer MUST sit OUTSIDE the block above. `defer` binds to its
+    // enclosing BLOCK, not to the function — placed inside, it would fire the
+    // instant the block ends, nulling the global before `serve()` ever reads
+    // it, and the watchdog would silently never start (no error, no log line:
+    // "off" and "cleared by mistake" look identical). See
+    // docs/gotchas/memory-pressure.md.
+    defer server_mod.g_mem_pressure = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //

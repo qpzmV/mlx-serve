@@ -8255,6 +8255,14 @@ fn memPressureWatchdogLoop(ctx: MemPressureCtx) void {
     while (!ctx.stop.load(.monotonic)) {
         _ = std.c.nanosleep(&poll_ts, null);
         const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(ctx.io, .awake).nanoseconds, std.time.ns_per_ms));
+        // Throttle BEFORE reading memory, not after. The thread has to wake
+        // every 500 ms to poll its stop flag, but on the wakes between
+        // intervals it must not touch memory at all: no getAvailableMemBytes
+        // syscall, and in probe mode no file open/read plus an allocation —
+        // a guard whose whole job is to react to low memory should not be
+        // allocating on a timer. `tick` re-checks the same interval, so the
+        // state machine stays correct on its own.
+        if (!w.checkDue(now_ms)) continue;
         const avail = w.availableBytes(ctx.io, ctx.allocator);
         switch (w.tick(now_ms, avail)) {
             .none => {},

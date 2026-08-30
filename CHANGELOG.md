@@ -4,11 +4,12 @@
 
 ### Features
 
-- **Machine-wide memory-pressure guard (`--memory-pressure`).** mlx-serve now watches available RAM on its own 500 ms watchdog thread (started *before* the model load — the most memory-dangerous moment) and, when free RAM sits under a watermark for a grace period, gives the RAM back instead of being OOM-killed: `.evict` unloads the least-recently-used resident model, `.exit` calls `exit(0)` so you can restart the server. On macOS there is no OOM killer, so this is the server's own safety net. Default watermark `max(10 GB, RAM/8)` (16 GB on a 128 GB machine), hysteresis `max(2 GB, RAM/64)`, grace `30 s` (override with `--memory-pressure-exit-after <ms>`; `off` disables, `auto` restores the default). A probe file (`MLX_SERVE_MEM_PROBE_FILE`, a float holding free RAM in GB) feeds fake readings so the guard can be tested without touching real RAM. Covered by `tests/test_mem_pressure.sh` and 17 unit tests in `src/mem_pressure.zig`.
+- **Machine-wide memory-pressure guard (`--memory-pressure`).** mlx-serve now watches available RAM on its own 500 ms watchdog thread (started *before* the model load — the most memory-dangerous moment) and, when free RAM sits under a watermark for a grace period, gives the RAM back instead of being OOM-killed: `.evict` unloads the least-recently-used resident model, `.exit` calls `exit(0)` so you can restart the server. On macOS there is no OOM killer, so this is the server's own safety net. Default watermark `max(min(10 GB, RAM/4), RAM/8)` — adaptive, so it is 16 GB on a 128 GB machine but a survivable 4 GB on a 16 GB one — hysteresis `max(min(2 GB, RAM/32), RAM/64)`, grace `30 s` (`--memory-pressure-exit-after <ms>`), check interval `5 s` (`--memory-pressure-check-interval`); `off` disables, `auto` restores the default. A probe file (`MLX_SERVE_MEM_PROBE_FILE`, a float holding free RAM in GB) feeds fake readings so the guard can be tested without touching real RAM. Covered by `tests/test_mem_pressure.sh` and 18 unit tests in `src/mem_pressure.zig`.
 
 ### Fixes
 
 - Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
+- `/v1/responses` rejected requests from Codex and other o-series clients with `jinja render failed (Unexpected message role)`. Those clients send `role: "developer"`; it is now folded to `system` at every entry point, and a client that sends *both* `instructions` and a developer message gets them merged into a single leading system message instead of a second, non-leading one that chat templates reject.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 

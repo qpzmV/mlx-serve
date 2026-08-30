@@ -3,9 +3,20 @@
 #
 # The guard is driven entirely through the probe file (MLX_SERVE_MEM_PROBE_FILE,
 # a file holding available RAM in GB as a float): the test writes fake readings
-# and never consumes a byte of real RAM. Two scenarios:
-#   1. sustained pressure → the process exits cleanly with code 0;
-#   2. recovery above the watermark+ hysteresis resets the exit countdown.
+# and never consumes a byte of real RAM.
+#
+# Two things are checked, and they are NOT equally skippable:
+#   1. the guard STARTS ("guard ON", logged inside serve() BEFORE Scheduler.init,
+#      so it is independent of how big the model is) — asserted ALWAYS. A guard
+#      that never starts must FAIL, never SKIP: an earlier wiring bug put the
+#      `defer` that clears the global inside a block, so it fired immediately,
+#      the watchdog never spawned, and a SKIP path hid it behind a green run.
+#   2. the guard ACTS (clean exit) — this needs the process to stay up long
+#      enough, so it SKIPs when the load preflight refuses the model first.
+#
+# The intervals are deliberately tiny (100 ms checks) so the countdown fires
+# BEFORE the model load gets anywhere: the process then exits having allocated
+# no weights, which is both fast and free of any real memory pressure.
 #
 # Usage: ./tests/test_mem_pressure.sh [model_dir] [port]
 #   Needs any loadable model dir for CPU-side setup (config.json + tokenizer).
@@ -26,6 +37,10 @@ check() {
     if [ "$ok" = "1" ]; then PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC} $desc"
     else FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC} $desc"; fi
 }
+# `check` takes 1 = pass, but `grep -q` returns 0 = FOUND. Passing `$?`
+# straight through inverts every assertion — a green-looking FAIL and a
+# red-looking PASS. Always route grep results through this.
+grepok() { if grep -q "$1" "$2" 2>/dev/null; then echo 1; else echo 0; fi; }
 
 if [ ! -d "$MODEL" ]; then
     echo "SKIP: model dir not found: $MODEL"
@@ -45,59 +60,86 @@ wait_gone() { # pid timeout_s → 0 if process exited within timeout
     return 1
 }
 
-# ── Scenario 1: sustained pressure → clean exit(0) (probe-driven, fake RAM) ─
-# The probe file holds a fake available-RAM reading (in GB); the guard never
-# touches real memory, so this exercises the full exit(0) path with NO real
-# RAM pressure. Bar = 10 GB; probe stays at 9.0 (under) so the 3 s countdown
-# fires. The watchdog starts BEFORE Scheduler.init, so "guard ON" is logged
-# before the load even begins.
+# ── Scenario 1: guard starts, and sustained pressure exits cleanly ─────────
+# Fake reading 9.0 GB against a 10 GB bar, checked every 100 ms and exiting
+# after 200 ms of sustained pressure. Real RAM is never touched (probe file).
 echo "9.0" > "$PROBE"
 MLX_SERVE_MEM_PROBE_FILE="$PROBE" "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level info \
-    --memory-pressure 10GB --memory-pressure-exit-after 3000 > "$LOG" 2>&1 &
+    --memory-pressure 10GB \
+    --memory-pressure-check-interval 100 \
+    --memory-pressure-exit-after 200 > "$LOG" 2>&1 &
 PID=$!
 
-# If the machine cannot hold the model, the load preflight refuses and the
-# process ends before the guard can be exercised. That is an environment
-# limit (no fitting model here), not a guard failure → SKIP with a hint.
-# Pass a small loadable model as $1 to exercise the full path on a real host.
-for i in $(seq 1 240); do
-    grep -q "Insufficient memory" "$LOG" 2>/dev/null && {
-        echo "SKIP: model '${MODEL}' does not fit this machine's available RAM (preflight refused)."
-        echo "      Pass a small loadable model dir as \$1 to exercise the full guard path:"
-        echo "        ./tests/test_mem_pressure.sh /path/to/small-model"
-        kill -9 "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -f "$PROBE"
-        exit 0
-    }
+# (1) GUARD STARTUP — never skipped. "guard ON" is logged before Scheduler.init,
+#     so it appears whether or not the model could ever load.
+for i in $(seq 1 60); do
     grep -q "guard ON" "$LOG" 2>/dev/null && break
     sleep 0.5
 done
-grep -q "guard ON" "$LOG" 2>/dev/null
-check "guard announces itself before the load ([mem-pressure] guard ON)" "$?"
-wait_gone "$PID" 15
-check "sustained pressure (9 GB < 10 GB bar for 3 s) exits the process" "$?"
-grep -q "exiting cleanly" "$LOG" 2>/dev/null
-check "exit is the guard's clean exit(0), not a crash" "$?"
+check "guard announces itself before the load ([mem-pressure] guard ON)" "$(grepok "guard ON" "$LOG")"
+
+# (2) GUARD ACTION — the clean exit. Only meaningful if the process died for
+#     OUR reason; a preflight refusal ends it first, which is an environment
+#     limit (no model on this box fits), not a guard defect.
+if wait_gone "$PID" 20; then
+    if grep -q "exiting cleanly" "$LOG" 2>/dev/null; then
+        check "sustained pressure (9 GB < 10 GB bar) exits the process cleanly" "1"
+        check "exit is the guard's exit(0), not a crash" "1"
+    elif grep -q "Insufficient memory" "$LOG" 2>/dev/null; then
+        echo "SKIP: the load preflight refused the model before the guard's countdown could finish."
+        echo "      Guard STARTUP was verified above; the EXIT PATH was not exercised here."
+        echo "      Pass a small loadable model dir as \$1 to exercise it:"
+        echo "        ./tests/test_mem_pressure.sh /path/to/small-model"
+    else
+        echo "--- process exited, but not via the guard; log tail: ---"
+        tail -n 5 "$LOG" | sed 's/^/      /'
+        check "sustained pressure exits the process cleanly" "0"
+    fi
+else
+    echo "--- process still alive after 20 s; log tail: ---"
+    tail -n 5 "$LOG" | sed 's/^/      /'
+    check "sustained pressure exits the process cleanly" "0"
+fi
 kill -9 "$PID" 2>/dev/null
 wait "$PID" 2>/dev/null
 
-# ── Scenario 2: recovery resets the countdown (probe-driven, fake RAM) ─────
-# Same probe file; a successful load is NOT required — the probe drives the
-# guard readings while the process is simply alive.
+# ── Scenario 2: recovery above the bar resets the countdown ────────────────
+# Same probe. A longer countdown (3 s) leaves room to raise the reading above
+# watermark+hysteresis (10+2 = 12 GB) and prove the countdown restarted.
 echo "9.0" > "$PROBE"
 MLX_SERVE_MEM_PROBE_FILE="$PROBE" "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level info \
-    --memory-pressure 10GB --memory-pressure-exit-after 4000 > "$LOG" 2>&1 &
+    --memory-pressure 10GB \
+    --memory-pressure-check-interval 100 \
+    --memory-pressure-exit-after 3000 > "$LOG" 2>&1 &
 PID=$!
-sleep 2          # t≈2 s: countdown running since t0 (would exit at t≈4 s)
-echo "13.0" > "$PROBE"  # recovery: above watermark (10) + hysteresis (2)
-sleep 4          # t≈6 s: a sticky countdown would have fired at t≈4 s
-if kill -0 "$PID" 2>/dev/null; then
-    check "recovery above the bar resets the exit countdown" "1"
-else
+
+for i in $(seq 1 60); do
+    grep -q "guard ON" "$LOG" 2>/dev/null && break
+    sleep 0.5
+done
+check "scenario 2: guard starts before the load" "$(grepok "guard ON" "$LOG")"
+
+sleep 1
+echo "13.0" > "$PROBE"   # recovery: above watermark (10) + hysteresis (2)
+sleep 2                  # a sticky countdown would have exited ~2 s in
+if ! kill -0 "$PID" 2>/dev/null; then
+    if grep -q "Insufficient memory" "$LOG" 2>/dev/null; then
+        echo "SKIP: preflight refused the model before the recovery path could run."
+        echo "      Guard STARTUP was verified; the RECOVERY PATH was not."
+        kill -9 "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -f "$PROBE"
+        exit 0
+    fi
     check "recovery above the bar resets the exit countdown" "0"
+else
+    check "recovery above the bar resets the exit countdown" "1"
 fi
-echo "9.0" > "$PROBE"   # fresh dip: countdown restarts from here
-wait_gone "$PID" 15
-check "fresh dip after recovery exits again (code 0)" "$?"
+
+echo "9.0" > "$PROBE"    # fresh dip: countdown restarts from here
+if wait_gone "$PID" 15; then
+    check "fresh dip after recovery exits again (code 0)" "$(grepok "exiting cleanly" "$LOG")"
+else
+    check "fresh dip after recovery exits again (code 0)" "0"
+fi
 kill -9 "$PID" 2>/dev/null
 wait "$PID" 2>/dev/null
 
