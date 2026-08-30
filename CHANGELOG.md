@@ -2,6 +2,10 @@
 
 ## v26.9.1 (unreleased)
 
+### Features
+
+- **Machine-wide memory-pressure guard (`--memory-pressure`).** mlx-serve now watches available RAM on its own 500 ms watchdog thread (started *before* the model load — the most memory-dangerous moment) and, when free RAM sits under a watermark for a grace period, gives the RAM back instead of being OOM-killed: `.evict` unloads the least-recently-used resident model, `.exit` calls `exit(0)` so you can restart the server. On macOS there is no OOM killer, so this is the server's own safety net. Default watermark `max(10 GB, RAM/8)` (16 GB on a 128 GB machine), hysteresis `max(2 GB, RAM/64)`, grace `30 s` (override with `--memory-pressure-exit-after <ms>`; `off` disables, `auto` restores the default). A probe file (`MLX_SERVE_MEM_PROBE_FILE`, a float holding free RAM in GB) feeds fake readings so the guard can be tested without touching real RAM. Covered by `tests/test_mem_pressure.sh` and 17 unit tests in `src/mem_pressure.zig`.
+
 ### Fixes
 
 - Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
