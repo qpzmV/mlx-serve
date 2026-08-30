@@ -19,6 +19,7 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const mem_pressure_mod = @import("mem_pressure.zig");
 const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -583,6 +584,12 @@ var global_scheduler: ?*scheduler_mod.Scheduler = null;
 /// `serve()`); handleConnection resolves `model` body fields against this
 /// per request via `ensureLoaded`/`release`.
 var global_registry: ?*ModelRegistry = null;
+
+/// Machine-wide memory-pressure guard (feature: --memory-pressure). Set from
+/// main.zig before serve() — null/zero watermark = guard off. The watchdog
+/// thread (spawned in serve) ticks this state machine on its own cadence and
+/// acts on `.evict` / `.exit`; it never touches the decode path.
+pub var g_mem_pressure: ?mem_pressure_mod.PressureWatch = null;
 
 /// Plan 05 — extract the `"model":"..."` value from a JSON request body
 /// without doing a full parse. Returns a borrowed slice into `body` (valid
@@ -1199,6 +1206,38 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
+
+    // Memory-pressure watchdog (--memory-pressure): started BEFORE
+    // `Scheduler.init` so the guard is live during the model load — loading a
+    // large model is exactly when available RAM is most likely to dip under
+    // the watermark. The evict path tolerates `global_scheduler == null`
+    // (nothing resident yet → nothing to evict), and the LIFO defers below
+    // run after `scheduler.deinit()`, by which point `global_scheduler` is
+    // already null, so the loop can't touch a torn-down scheduler.
+    var memwatch_thread: ?std.Thread = null;
+    var memwatch_stop = std.atomic.Value(bool).init(false);
+    if (g_mem_pressure) |*watch| {
+        const mp_ctx = MemPressureCtx{
+            .watch = watch,
+            .allocator = allocator,
+            .io = io,
+            .stop = &memwatch_stop,
+        };
+        memwatch_thread = std.Thread.spawn(.{}, memPressureWatchdogLoop, .{mp_ctx}) catch |err| blk: {
+            log.err("mem-pressure watchdog spawn failed: {}\n", .{err});
+            break :blk null;
+        };
+        if (memwatch_thread != null) {
+            log.info("[mem-pressure] guard ON — watermark {d:.1} GB, hysteresis {d:.1} GB, exit after {d} s\n", .{
+                @as(f64, @floatFromInt(watch.watermark_bytes)) / 1_073_741_824.0,
+                @as(f64, @floatFromInt(watch.hysteresis_bytes)) / 1_073_741_824.0,
+                @divTrunc(watch.exit_after_ms, 1000),
+            });
+        }
+    }
+    // LIFO: join deferred first → runs second. stop deferred second → runs first.
+    defer if (memwatch_thread) |t| t.join();
+    defer memwatch_stop.store(true, .monotonic);
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
     //    Transformer/vision/drafter load, JIT compile, and warmup before
@@ -8292,6 +8331,65 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
         if (tick < SAMPLE_INTERVAL_TICKS) continue;
         tick = 0;
         sampleGauges(ctx);
+    }
+}
+
+const MemPressureCtx = struct {
+    watch: *mem_pressure_mod.PressureWatch,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stop: *std.atomic.Value(bool),
+};
+
+/// Memory-pressure watchdog thread (spawned in `serve` when the guard is on).
+/// Own cadence — 500 ms wakeups against the stop flag, one real
+/// `tick()` per `check_interval_ms` (default 5 s) — so the guard never runs
+/// on the per-token decode path. `.evict` unloads the LRU refcount==0
+/// resident model via the same blocking unload path the /v1/unload-model
+/// endpoint uses; `.exit` quits the process cleanly (macOS has no OOM killer
+/// — a Mac under death-spiral pressure needs us to give the RAM back, and
+/// the operator restarts the server).
+fn memPressureWatchdogLoop(ctx: MemPressureCtx) void {
+    const w = ctx.watch;
+    // Idle fast-path: guard disabled → a 1 Hz flag check and nothing else.
+    if (w.watermark_bytes == 0) {
+        const idle_ts = std.c.timespec{ .sec = 1, .nsec = 0 };
+        while (!ctx.stop.load(.monotonic)) _ = std.c.nanosleep(&idle_ts, null);
+        return;
+    }
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(ctx.io, .awake).nanoseconds, std.time.ns_per_ms));
+        const avail = w.availableBytes(ctx.io, ctx.allocator);
+        switch (w.tick(now_ms, avail)) {
+            .none => {},
+            .evict => {
+                const sch = global_scheduler orelse continue;
+                // Pick the victim under the registry lock, then dupe its id so
+                // nothing can free the entry out from under us after unlock.
+                sch.registry.mutex.lockUncancelable(sch.io);
+                const victim = sch.registry.pickLruEvictable("");
+                const vid: ?[]u8 = if (victim) |v|
+                    (sch.registry.allocator.dupe(u8, v.id) catch null)
+                else
+                    null;
+                sch.registry.mutex.unlock(sch.io);
+                if (vid) |id| {
+                    log.warn("[mem-pressure] available RAM under the watermark — evicting idle resident model '{s}'\n", .{id});
+                    sch.unloadModel(id) catch |err| {
+                        log.err("[mem-pressure] evict of '{s}' failed: {}\n", .{ id, err });
+                    };
+                    sch.registry.allocator.free(id);
+                }
+                // No evictable model (all pinned / nothing resident): the
+                // countdown keeps running — sustained pressure still exits.
+            },
+            .exit => {
+                log.err("[mem-pressure] available RAM has sat under the watermark for {d} s — exiting cleanly (code 0) to give its RAM back. Restart mlx-serve when memory frees up.\n", .{@divTrunc(w.exit_after_ms, 1000)});
+                std.process.exit(0);
+            },
+        }
     }
 }
 

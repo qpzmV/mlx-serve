@@ -13,6 +13,8 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const mem_pressure_mod = @import("mem_pressure.zig");
+const status_mod = @import("status.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
@@ -305,6 +307,19 @@ fn printUsage(io: std.Io) void {
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
+        \\  --memory-pressure <n>{{KB,MB,GB}}|auto|off
+        \\                      Machine-wide available-RAM guard. Default
+        \\                        'auto' = max(10 GB, RAM/8) — 16 GB on a
+        \\                        128 GB Mac. While available RAM sits under
+        \\                        the watermark the guard evicts one idle
+        \\                        resident model; sustained pressure exits
+        \\                        the process cleanly (code 0) so the RAM is
+        \\                        given back — restart the server afterwards.
+        \\                        'off' disables the guard entirely.
+        \\  --memory-pressure-exit-after <ms>
+        \\                      Sustained-pressure milliseconds before the
+        \\                        clean exit(0). Default: 30000. 0 = evict
+        \\                        only, never exit.
         \\  --metrics           Enable Prometheus metrics at GET /metrics and a
         \\                        live metrics panel on the index page (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
@@ -498,6 +513,10 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
+    // Memory-pressure guard. null = auto (max(10 GB, RAM/8) watermark), 0 =
+    // off, n = explicit watermark bytes. Exit countdown default 30 s.
+    var mem_pressure_arg: ?u64 = null;
+    var mem_pressure_exit_after_ms: i64 = 30_000;
     var metrics_enabled = false;
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
@@ -828,6 +847,27 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;
+        } else if (std.mem.eql(u8, args[i], "--memory-pressure") and i + 1 < args.len) {
+            // Machine-wide memory-pressure guard. 'auto' (or absent flag) →
+            // max(10 GB, RAM/8) watermark; 'off'/'0' → disabled; otherwise an
+            // explicit byte size (same suffixes as --max-resident-mem).
+            i += 1;
+            if (std.mem.eql(u8, args[i], "off")) {
+                mem_pressure_arg = 0;
+            } else if (std.mem.eql(u8, args[i], "auto")) {
+                mem_pressure_arg = null;
+            } else {
+                mem_pressure_arg = parseSizeArg(args[i]) catch {
+                    log.err("--memory-pressure: expected '<n>{{MB,GB,KB}}', 'auto' or 'off'; got '{s}'\n", .{args[i]});
+                    std.process.exit(1);
+                };
+            }
+        } else if (std.mem.eql(u8, args[i], "--memory-pressure-exit-after") and i + 1 < args.len) {
+            i += 1;
+            mem_pressure_exit_after_ms = std.fmt.parseInt(i64, args[i], 10) catch {
+                log.err("--memory-pressure-exit-after: expected milliseconds; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
@@ -1018,6 +1058,29 @@ pub fn main(init: std.process.Init) !void {
     var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
     if (metrics_instance) |*m| server_mod.g_metrics = m;
     defer server_mod.g_metrics = null;
+
+    // Memory-pressure guard (feature: --memory-pressure). Same placement
+    // contract as g_metrics above: set before every serve-dispatch path, so
+    // `server_mod.serve()` spawns the watchdog regardless of engine. Default
+    // is ON with a machine-scaled watermark (max(10 GB, RAM/8) — 16 GB on a
+    // 128 GB Mac): the guard exists because macOS has no OOM killer, and a
+    // wedged machine needs the server to yield. `--memory-pressure off` opts
+    // out. The probe file (MLX_SERVE_MEM_PROBE_FILE, a file holding available
+    // GB as a float) replaces the real RAM read when set — integration tests
+    // drive the whole guard through it and never touch real memory.
+    {
+        const total = status_mod.getTotalMemBytes();
+        const watermark: u64 = mem_pressure_arg orelse mem_pressure_mod.PressureWatch.defaultWatermarkBytes(total);
+        const hysteresis = mem_pressure_mod.PressureWatch.defaultHysteresisBytes(total);
+        const probe_env = std.c.getenv("MLX_SERVE_MEM_PROBE_FILE");
+        server_mod.g_mem_pressure = .{
+            .watermark_bytes = watermark,
+            .hysteresis_bytes = hysteresis,
+            .exit_after_ms = mem_pressure_exit_after_ms,
+            .probe_file = if (probe_env) |p| std.mem.span(p) else null,
+        };
+        defer server_mod.g_mem_pressure = null;
+    }
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
