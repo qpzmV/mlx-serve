@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
+const expert_store = @import("expert_store.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
@@ -320,6 +321,19 @@ fn printUsage(io: std.Io) void {
         \\                        wakes every 500 ms to poll its stop flag but
         \\                        reads nothing between checks. Lower it to
         \\                        make the exit countdown more responsive.
+        \\  --expert-stream     qwen4_exp only: stream MoE experts from disk into
+        \\                        a fixed shared slot pool instead of materializing
+        \\                        all ~77 GB, so a 128 GB machine can serve the
+        \\                        model. Off by default (every model loads as
+        \\                        before). Also settable via MLX_SERVE_EXPERT_STREAM=1.
+        \\  --expert-pool-gb <n>  Expert slot pool budget in GB when --expert-stream
+        \\                        is on. Default 16 (= ~108 experts/layer, ~21%
+        \\                        coverage on Vontra). Clamped down to the memory
+        \\                        budget at load (WARN, never abort); the pool also
+        \\                        shrinks under runtime memory pressure.
+        \\  --experts-per-layer <n>
+        \\                        Size the pool by experts resident per layer
+        \\                        instead of --expert-pool-gb (overrides it).
         \\  --metrics           Enable Prometheus metrics at GET /metrics and a
         \\                        live metrics panel on the index page (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
@@ -517,6 +531,11 @@ pub fn main(init: std.process.Init) !void {
     // off, n = explicit watermark bytes. Exit countdown default 30 s.
     var mem_pressure_arg: ?u64 = null;
     var mem_pressure_exit_after_ms: i64 = 30_000;
+    // qwen4_exp disk-backed MoE expert streaming (--expert-stream). The pool
+    // size is either an absolute GB budget or an explicit experts-per-layer.
+    var expert_stream = false;
+    var expert_pool_gb: u32 = 16;
+    var experts_per_layer: u32 = 0;
     // How often the watchdog takes a REAL reading (RAM read or probe read).
     // The thread still wakes every 500 ms to poll its stop flag, but it does
     // not touch memory between intervals. Also the resolution of the exit
@@ -693,6 +712,26 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--expert-stream")) {
+            expert_stream = true;
+        } else if (std.mem.eql(u8, args[i], "--expert-pool-gb") and i + 1 < args.len) {
+            i += 1;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            if (v == 0) {
+                log.err("--expert-pool-gb: expected a positive number of GB; got '{s}'\n", .{args[i]});
+                return error.BadUsage;
+            }
+            expert_pool_gb = v;
+            expert_stream = true;
+        } else if (std.mem.eql(u8, args[i], "--experts-per-layer") and i + 1 < args.len) {
+            i += 1;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            if (v == 0) {
+                log.err("--experts-per-layer: expected a positive expert count; got '{s}'\n", .{args[i]});
+                return error.BadUsage;
+            }
+            experts_per_layer = v;
+            expert_stream = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
             // 0 = full history; otherwise the last-N-token window applied
@@ -1087,6 +1126,11 @@ pub fn main(init: std.process.Init) !void {
             .check_interval_ms = mem_pressure_check_interval_ms,
             .probe_file = if (probe_env) |p| std.mem.span(p) else null,
         };
+        // The expert slot pool budgets against the SAME watermark the watchdog
+        // uses — a custom --memory-pressure must shrink the pool too, else the
+        // user's own bar sentences the pool to death and the pool never learns.
+        expert_store.g_watermark_bytes = watermark;
+        expert_store.g_hysteresis_bytes = hysteresis;
     }
     // NOTE: this defer MUST sit OUTSIDE the block above. `defer` binds to its
     // enclosing BLOCK, not to the function — placed inside, it would fire the
@@ -1095,6 +1139,24 @@ pub fn main(init: std.process.Init) !void {
     // "off" and "cleared by mistake" look identical). See
     // docs/gotchas/memory-pressure.md.
     defer server_mod.g_mem_pressure = null;
+
+    // Expert streaming: resolve the request (CLI flag or env) and publish it to
+    // model.zig's process globals BEFORE any config is parsed. parseConfig
+    // promotes it onto each qwen4 ModelConfig (serve cold-loads included), so the
+    // set-once here is the single source of truth for the whole process.
+    if (std.c.getenv("MLX_SERVE_EXPERT_STREAM")) |v| {
+        if (!std.mem.eql(u8, std.mem.span(v), "0")) expert_stream = true;
+    }
+    model_mod.expert_stream_requested = expert_stream;
+    model_mod.expert_pool_gb_req = expert_pool_gb;
+    model_mod.experts_per_layer_req = experts_per_layer;
+    if (expert_stream) {
+        if (experts_per_layer > 0) {
+            log.info("[expert] streaming requested ({d} experts/layer); applied to qwen4_exp models only\n", .{experts_per_layer});
+        } else {
+            log.info("[expert] streaming requested (pool {d} GB); applied to qwen4_exp models only\n", .{expert_pool_gb});
+        }
+    }
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
@@ -1433,10 +1495,12 @@ pub fn main(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         log.info("Loading weights...\n", .{});
+        model_mod.g_expert_stream = config.expert_stream;
         var weights = if (load_vision)
             try model_mod.loadWeightsWithVision(io, allocator, model_dir)
         else
             try model_mod.loadWeights(io, allocator, model_dir);
+        model_mod.g_expert_stream = false;
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
 

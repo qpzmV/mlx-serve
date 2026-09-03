@@ -2,8 +2,11 @@ const std = @import("std");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mlx = @import("mlx.zig");
+const expert_store = @import("expert_store.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
+const status_mod = @import("status.zig");
+const mem_pressure_mod = @import("mem_pressure.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantScheme = kv_quant.Scheme;
@@ -4698,6 +4701,12 @@ pub const MoeMlpWeights = struct {
     // shared-expert "sink") — not qwen's gated single expert, not hy3's
     // ungated add. Read only by the inkling forward arm.
     router_global_scale: ?mlx.mlx_array = null,
+    // qwen4_exp expert streaming: the trunk layer index this MoE block is, so
+    // `moeMLP2` can key the global slot pool's (layer, expert) map without a
+    // per-call-site layer argument. Set in `initMoeLayers`. Harmless for every
+    // other arch. `appendHybridMlpWeights` walks only array-typed fields, so a
+    // plain u16 is never pulled into the load-time batch eval.
+    expert_layer_id: u16 = 0,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -6275,6 +6284,15 @@ pub const Transformer = struct {
     /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
     qwen4_mtp: ?Qwen4Mtp = null,
 
+    // qwen4_exp expert streaming (both null unless --expert-stream on a qwen4
+    // model). `expert_store_ptr` owns the safetensors header index + shard fds;
+    // `expert_pool` is the ONE global slot pool shared across all 48 trunk MoE
+    // layers (CLOCK eviction lets hot layers borrow slots from cold ones).
+    // `moeMLP2` substitutes `expert_pool.pools` for a trunk layer's null switch_*
+    // banks and remaps expert ids → pool slots.
+    expert_store_ptr: ?*expert_store.ExpertStore = null,
+    expert_pool: ?*expert_store.SlotPool = null,
+
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
     bert_pos_w: mlx.mlx_array,
@@ -6888,6 +6906,10 @@ pub const Transformer = struct {
         var qwen4_state: ?*qwen4_mod.Qwen4State = null;
         var qwen4_mixer: ?HcWeights = null;
         var qwen4_mtp: ?Qwen4Mtp = null;
+        // Expert streaming (qwen4 + --expert-stream only): the disk header index
+        // and the ONE global slot pool shared by all 48 trunk MoE layers.
+        var expert_store_ptr: ?*expert_store.ExpertStore = null;
+        var expert_pool: ?*expert_store.SlotPool = null;
         if (config.isQwen4()) {
             var extra: std.ArrayList(mlx.mlx_array) = .empty;
             defer extra.deinit(allocator);
@@ -6914,6 +6936,67 @@ pub const Transformer = struct {
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
+
+            // Expert streaming (Step 4/5). Built HERE — after the load-time batch
+            // eval and the MTP bind — because only now is non-expert residency
+            // final, so the budget clamp runs on honest numbers (handoff §5.4).
+            if (config.expert_stream) {
+                const table_path = config.ngram_table_path orelse return error.MissingNgramTable;
+                const model_dir = std.fs.path.dirname(table_path) orelse ".";
+                const store = try expert_store.ExpertStore.init(io, allocator, model_dir, config.num_hidden_layers, config.num_experts);
+                errdefer store.deinit();
+                expert_store_ptr = store;
+
+                const GiB: u64 = 1 << 30;
+                const record = store.record_bytes;
+                std.debug.assert(record > 0);
+                const requested: u64 = if (config.experts_per_layer > 0)
+                    @as(u64, config.experts_per_layer) * config.num_hidden_layers
+                else
+                    @as(u64, config.expert_pool_gb) * 1_000_000_000 / record;
+
+                // Clamp (handoff §5.2): available − (watermark + hysteresis +
+                // 4 GiB hysteresis-band margin) − 4 GiB staging allowance (one
+                // prefill layer can touch at most all 512 experts = ~1.57 GB,
+                // padded). Oversize CLAMPS with a WARN, never aborts — aborting is
+                // worse than degrading (the watchdog would only exit 30 s later
+                // anyway). Undersize raises to the 24-experts/layer floor: below
+                // it the CLOCK thrashes and throughput collapses.
+                const avail = status_mod.getAvailableMemBytes();
+                const total = status_mod.getTotalMemBytes();
+                const wm = if (expert_store.g_watermark_bytes != 0)
+                    expert_store.g_watermark_bytes
+                else
+                    mem_pressure_mod.PressureWatch.defaultWatermarkBytes(total);
+                const hy = if (expert_store.g_hysteresis_bytes != 0)
+                    expert_store.g_hysteresis_bytes
+                else
+                    mem_pressure_mod.PressureWatch.defaultHysteresisBytes(total);
+                const budget = avail -| (wm + hy + 8 * GiB);
+                const lower: u64 = @as(u64, expert_store.POOL_FLOOR_EXPERTS_PER_LAYER) * config.num_hidden_layers;
+                var slots = requested;
+                if (slots * record > budget) {
+                    const clamped = @max(budget / record, lower);
+                    log.warn("[expert] pool {d} slots ({d:.2} GB dec) exceeds the {d:.2} GiB budget (watermark {d:.2} GiB + hysteresis + margins) — clamped to {d}\n", .{
+                        slots, @as(f64, @floatFromInt(slots * record)) / 1_000_000_000.0, @as(f64, @floatFromInt(budget)) / GiB,
+                        @as(f64, @floatFromInt(wm)) / GiB, clamped,
+                    });
+                    slots = clamped;
+                    if (slots * record > budget +| lower * record) return error.OutOfMemory; // machine genuinely can't fit the floor
+                } else if (slots < lower) {
+                    log.warn("[expert] pool {d} slots under the {d}-slot floor (24 experts/layer) — raising; hit rate thrashes below it\n", .{ slots, lower });
+                    slots = lower;
+                }
+
+                const pool = try expert_store.SlotPool.init(allocator, s, store, @intCast(slots));
+                errdefer pool.deinit();
+                expert_pool = pool;
+                log.info("[expert] pool {d} slots ({d:.2} GB dec), {d} layers, {d:.3} MB(dec)/record, budget {d:.2} GiB, watermark {d:.2} GiB, requested {d} slots\n", .{
+                    slots, @as(f64, @floatFromInt(slots * record)) / 1_000_000_000.0, config.num_hidden_layers,
+                    @as(f64, @floatFromInt(record)) / 1_000_000.0, @as(f64, @floatFromInt(budget)) / GiB,
+                    @as(f64, @floatFromInt(wm)) / GiB, requested,
+                });
+            }
         }
 
         const profile_head_shape = mlx.getShape(lm_head_w);
@@ -6943,6 +7026,8 @@ pub const Transformer = struct {
             .qwen4 = qwen4_state,
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
+            .expert_store_ptr = expert_store_ptr,
+            .expert_pool = expert_pool,
             .lm_head_w = lm_head_w,
             .lm_head_s = lm_head_s,
             .lm_head_b = lm_head_b,
@@ -7785,6 +7870,16 @@ pub const Transformer = struct {
             st.deinit();
             self.allocator.destroy(st);
             self.qwen4 = null;
+        }
+        // Expert streaming: pool first (it references the store), then the store
+        // (it owns the shard fds).
+        if (self.expert_pool) |pool| {
+            pool.deinit();
+            self.expert_pool = null;
+        }
+        if (self.expert_store_ptr) |es| {
+            es.deinit();
+            self.expert_store_ptr = null;
         }
         // Hybrid layers own no arrays of their own — their weights are tracked
         // by `moe_owned_bf16`/`ssm_entries` above — but the slice itself is ours.
@@ -11853,6 +11948,10 @@ pub const Transformer = struct {
         mcfg.full_attention_interval = 1; // layer 0 is the full-attention layer
         mcfg.linear_attn_tail_from = 0;
         mcfg.ple_layer_idx = -1;
+        // The draft layer always binds its OWN resident 512-expert bank: the
+        // slot pool covers only the 48 trunk layers (ExpertStore's refs are built
+        // from `model.layers.{d}`), and its keys were never skipped by the loader.
+        mcfg.expert_stream = false;
         const ml = try initMoeLayers(allocator, mcfg, weights, name_buf, s);
         var owned: std.ArrayList(mlx.mlx_array) = .empty;
         errdefer owned.deinit(allocator);
@@ -17145,10 +17244,18 @@ pub const Transformer = struct {
         // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
         // (and, with non-affine modes, group size + mode) per weight — resolve
         // each individually. gate/up consume the hidden dim; down consumes the
-        // expert intermediate dim.
-        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
-        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
-        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
+        // expert intermediate dim. Resolved AFTER the (streaming) slot-pool bank
+        // substitution below, so they reflect the array the paths actually index.
+        var gate_qp: QuantParams = undefined;
+        var up_qp: QuantParams = undefined;
+        var down_qp: QuantParams = undefined;
+        // qwen4_exp expert streaming: set when this layer's routed ids were
+        // remapped into the pool; the defer releases the layer's pins so the next
+        // MoE layer can evict them (CLOCK second chance).
+        var streaming_pool_active = false;
+        defer if (streaming_pool_active) {
+            if (self.expert_pool) |p| p.unpinAll();
+        };
 
         // Router: compute logits and top-K selection
         var router_logits: mlx.mlx_array = undefined;
@@ -17189,7 +17296,7 @@ pub const Transformer = struct {
             try self.computeHy3Routing(router_logits, bias)
         else
             try self.computeMoeRouting(router_logits);
-        const inds = routed.inds;
+        var inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
         defer _ = mlx.mlx_array_free(norm_scores);
@@ -17245,6 +17352,83 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_eval(inds));
             try mlx.check(mlx.mlx_array_eval(norm_scores));
             decode_prof.moe_router_ns += mclk.lap();
+        }
+
+        // ── qwen4_exp expert streaming (Step 2) ──
+        // PROTOCOL: `switch_gate_w.ctx == null` marks a streaming trunk layer
+        // (initMoeLayers binds the nine switch_* banks to empty handles when
+        // --expert-stream is on; the MTP draft layer binds its own resident bank
+        // and never enters this branch). For such a layer: dedup the routed
+        // expert ids, ensure they are resident in the ONE global slot pool
+        // (CLOCK + pread + mlx_scatter), then feed the three gather paths
+        // POOL SLOT ids and the pool's quantized banks. The remap happens
+        // BEFORE the argsort in the sorted path — slot ids are a monotonic
+        // relabeling of expert ids within a layer (the (layer,·) key is fixed
+        // here), so the gather_qmm fast path's "rhs_indices sorted" assumption
+        // stays true. Remapping AFTER the argsort would silently corrupt it.
+        var mwe: MoeMlpWeights = mw.*;
+        if (self.expert_pool) |pool| {
+            if (mw.switch_gate_w.ctx == null) {
+                // Routed ids → host u32.
+                var ids_u32 = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&ids_u32, inds, .uint32, self.s));
+                try mlx.check(mlx.mlx_array_eval(ids_u32));
+                const ninds = mlx.mlx_array_size(inds);
+                const ids_ptr = mlx.mlx_array_data_uint32(ids_u32) orelse return error.StreamingIdsNotHost;
+                const ids_slice = ids_ptr[0..ninds];
+
+                // Dedup in first-appearance order (slotstream's `ensure(uniq)`).
+                var uniq: std.ArrayList(u32) = .empty;
+                defer uniq.deinit(self.allocator);
+                var seen = std.AutoHashMap(u32, u32).init(self.allocator);
+                defer seen.deinit();
+                for (ids_slice) |e| {
+                    if (!seen.contains(e)) {
+                        try seen.put(e, @intCast(uniq.items.len));
+                        try uniq.append(self.allocator, e);
+                    }
+                }
+                const slots = try self.allocator.alloc(u32, uniq.items.len);
+                defer self.allocator.free(slots);
+                try pool.ensure(mw.expert_layer_id, uniq.items, slots);
+
+                // Rebuild `inds` with slot ids (same shape, uint32). The existing
+                // `defer free(inds)` releases this new array on function exit.
+                const remap = try self.allocator.alloc(u32, ninds);
+                defer self.allocator.free(remap);
+                for (ids_slice, 0..) |e, i| remap[i] = slots[seen.get(e).?];
+                const ish = mlx.getShape(inds);
+                const slot_inds = mlx.mlx_array_new_data(remap.ptr, ish.ptr, @intCast(ish.len), .uint32);
+                try mlx.check(mlx.mlx_array_eval(slot_inds));
+                _ = mlx.mlx_array_free(ids_u32);
+                _ = mlx.mlx_array_free(inds);
+                inds = slot_inds;
+
+                // Substitute the pool banks. Plain STRUCT copies — they alias the
+                // pool arrays' single reference without adding a C-level owner, so
+                // the next fill's scatter keeps its buffer-donation fast path.
+                mwe.switch_gate_w = pool.pools[0];
+                mwe.switch_gate_s = pool.pools[1];
+                mwe.switch_gate_b = pool.pools[2];
+                mwe.switch_up_w = pool.pools[3];
+                mwe.switch_up_s = pool.pools[4];
+                mwe.switch_up_b = pool.pools[5];
+                mwe.switch_down_w = pool.pools[6];
+                mwe.switch_down_s = pool.pools[7];
+                mwe.switch_down_b = pool.pools[8];
+                streaming_pool_active = true;
+            }
+        }
+        gate_qp = self.quantParamsHinted(mwe.switch_gate_w, mwe.switch_gate_s, lastDim(expert_x));
+        up_qp = self.quantParamsHinted(mwe.switch_up_w, mwe.switch_up_s, lastDim(expert_x));
+        down_qp = self.quantParamsHinted(mwe.switch_down_w, mwe.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
+
+        // Optional expert-pool telemetry (MLX_SERVE_EXPERT_STATS=N): every N
+        // streaming layer-visits dump hit-rate + per-fill timing. A per-fill time
+        // that climbs toward milliseconds (vs ~tens of µs) is the signature of a
+        // broken buffer-donation → whole-pool copy — invisible to golden tests.
+        if (streaming_pool_active) {
+            if (self.expert_pool) |tp| expert_stats_tick(tp);
         }
 
         const x_shape = mlx.getShape(expert_x);
@@ -17324,7 +17508,7 @@ pub const Transformer = struct {
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+            try gatherExpertMm(&gate_out_3d, x_rep, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
@@ -17332,7 +17516,7 @@ pub const Transformer = struct {
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+            try gatherExpertMm(&up_out_3d, x_rep, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -17351,7 +17535,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+            try gatherExpertMm(&down_3d, act_exp, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -17366,8 +17550,8 @@ pub const Transformer = struct {
             const hidden = mlx.getShape(down_unsorted)[1];
             const bskh_shape = [_]c_int{ B, S, K, hidden };
             try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &bskh_shape, 4, self.s));
-        } else if (B * S == 1 and useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
-            try self.moeDecodeGatherQmv(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
+        } else if (B * S == 1 and useGatherQmvDecode(self, gate_qp, up_qp) and mwe.switch_gate_s.ctx != null and mwe.switch_up_s.ctx != null and mwe.switch_down_s.ctx != null and
+            try self.moeDecodeGatherQmv(&down_out, expert_x, inds, norm_scores, &moe_reduced, &mwe, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             // ── Decode fast path: in-place gather-qmv kernel ──
             // Reads the expert bank directly with GPU-resident indices, so it
@@ -17376,7 +17560,7 @@ pub const Transformer = struct {
             // gather_qmm 349). Everything is done inside the predicate; a null
             // return (unsupported quant mode or width) falls through to the
             // batched take path below with no behaviour change.
-        } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
+        } else if (B * S == 1 and useBatchedExpertDecode(self) and mwe.switch_gate_s.ctx != null and mwe.switch_up_s.ctx != null and mwe.switch_down_s.ctx != null) {
             // ── Decode fast path: take experts + batched quantized_matmul ──
             // Dodges our libmlx's serialized decode gather_qmm. A per-arch
             // VALIDATED opt-in (laguna by default) — NOT default-on-for-all-MoE:
@@ -17398,15 +17582,15 @@ pub const Transformer = struct {
             const bc_shape = [_]c_int{ K, 1, D };
             try mlx.check(mlx.mlx_broadcast_to(&x_bc, x_1d, &bc_shape, 3, self.s));
 
-            const gate_out = try self.batchedExpertMm(x_bc, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, inds_flat, gate_qp.bits, gate_qp.group_size, gate_qp.mode); // [K,1,inter]
+            const gate_out = try self.batchedExpertMm(x_bc, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, inds_flat, gate_qp.bits, gate_qp.group_size, gate_qp.mode); // [K,1,inter]
             defer _ = mlx.mlx_array_free(gate_out);
-            const up_out = try self.batchedExpertMm(x_bc, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, inds_flat, up_qp.bits, up_qp.group_size, up_qp.mode); // [K,1,inter]
+            const up_out = try self.batchedExpertMm(x_bc, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, inds_flat, up_qp.bits, up_qp.group_size, up_qp.mode); // [K,1,inter]
             defer _ = mlx.mlx_array_free(up_out);
 
             const expert_act = try self.computeGeglu(gate_out, up_out); // [K,1,inter]
             defer _ = mlx.mlx_array_free(expert_act);
 
-            const down = try self.batchedExpertMm(expert_act, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, inds_flat, down_qp.bits, down_qp.group_size, down_qp.mode); // [K,1,hidden]
+            const down = try self.batchedExpertMm(expert_act, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, inds_flat, down_qp.bits, down_qp.group_size, down_qp.mode); // [K,1,hidden]
             defer _ = mlx.mlx_array_free(down);
             const hidden = mlx.getShape(down)[mlx.getShape(down).len - 1];
             const bskh_shape = [_]c_int{ B, S, K, hidden };
@@ -17420,14 +17604,14 @@ pub const Transformer = struct {
 
             var gate_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_5d);
-            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false, self.s);
+            try gatherExpertMm(&gate_out_5d, x_exp, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, no_idx, inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
-            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_qp.bits, up_qp.group_size, up_qp.mode, false, self.s);
+            try gatherExpertMm(&up_out_5d, x_exp, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, no_idx, inds, up_qp.bits, up_qp.group_size, up_qp.mode, false, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -17440,7 +17624,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_5d);
-            try gatherExpertMm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, down_qp.bits, down_qp.group_size, down_qp.mode, false, self.s);
+            try gatherExpertMm(&down_5d, act_exp, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, no_idx, inds, down_qp.bits, down_qp.group_size, down_qp.mode, false, self.s);
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
@@ -18926,17 +19110,29 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // `maybeTransposeForBf16` calls below pre-transpose bf16 weights from
             // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
+            //
+            // qwen4_exp EXPERT STREAMING: with --expert-stream the trunk
+            // routed-expert banks were never put into the weights map (they are
+            // streamed from disk by the global SlotPool), so the nine switch_*
+            // arrays bind to empty handles. PROTOCOL: `switch_gate_w.ctx == null`
+            // is how `moeMLP2` recognizes a streaming trunk layer and substitutes
+            // the pool banks — anyone restoring a real binding here silently
+            // orphans the pool path (out-of-range expert ids). Only qwen4 is
+            // affected: expert_stream is never set for qwen3.5 / qwen3_moe.
+            // The MTP draft layer binds through loadQwen4Mtp, which copies the
+            // config with expert_stream=false, so it always stays resident.
+            const stream = is_qwen4 and config.expert_stream;
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                .switch_gate_w = if (stream) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
                 .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                .switch_up_w = if (stream) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
                 .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                .switch_down_w = if (stream) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
                 .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
@@ -18951,6 +19147,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .shared_expert_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.weight"),
                 .shared_expert_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.scales") orelse mlx.mlx_array_new(),
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
+                .expert_layer_id = @intCast(li),
             } };
             {
                 const mw = &lw.mlp.moe;
@@ -24188,6 +24385,33 @@ fn downReduceFusedEnabled() bool {
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     downred_env = enabled;
     return enabled;
+}
+
+/// MLX_SERVE_EXPERT_STATS=N telemetry: every N streaming MoE-layer visits, dump
+/// the slot pool's cumulative hit-rate and per-fill cost. Disabled (unset/≤0) →
+/// a single cached compare per call, no cost on the decode path. A per-fill that
+/// reads in the millisecond range (vs the ~tens-of-µs a donated scatter costs)
+/// is the tell that buffer donation regressed to a whole-pool copy — which golden
+/// equivalence cannot catch (identical output, just slow).
+fn expert_stats_tick(pool: *expert_store.SlotPool) void {
+    const S = struct {
+        var stride: i64 = -1; // -1 = not yet read; <=0 = disabled
+        var calls: i64 = 0;
+    };
+    if (S.stride < 0) {
+        S.stride = if (std.c.getenv("MLX_SERVE_EXPERT_STATS")) |raw|
+            std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch 0
+        else
+            0;
+    }
+    if (S.stride <= 0) return;
+    S.calls += 1;
+    if (@rem(S.calls, S.stride) != 0) return;
+    const per_fill_us = @as(f64, @floatFromInt(pool.fill_ns)) / 1_000.0 / @as(f64, @floatFromInt(@max(@as(u64, 1), pool.fill_ops)));
+    log.info("[expert] stats visits={d} hits={d} misses={d} hit={d:.3} fill_ops={d} io={d:.1}MB per_fill={d:.1}us\n", .{
+        S.calls, pool.hits, pool.misses, pool.hitRate(), pool.fill_ops,
+        @as(f64, @floatFromInt(pool.io_bytes)) / 1_000_000.0, per_fill_us,
+    });
 }
 
 /// Fused down-projection + router weighting + K-reduction at decode width.
