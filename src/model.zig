@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const expert_store = @import("expert_store.zig");
 
 pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
 
@@ -279,6 +280,19 @@ pub const ModelConfig = struct {
     /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
     /// config does.
     ngram_table_path: ?[]const u8 = null,
+
+    // Expert streaming (qwen4_exp only). Runtime switches, NOT parsed from
+    // config.json — set by main.zig (CLI/env) and read by `initMoeLayers`
+    // (bind `switch_*` null so the trunk experts never materialize) and
+    // `Transformer.init` (build the global slot pool). `expert_stream` false =
+    // the ordinary resident path (every other model / every non-`--expert-stream`
+    // run is byte-identical to before).
+    expert_stream: bool = false,
+    /// Pool size in decimal GB (used when `experts_per_layer == 0`). Default 16.
+    expert_pool_gb: u32 = 16,
+    /// Pool size as experts resident per layer (0 = derive from expert_pool_gb).
+    /// Both go through the budget clamp in `Transformer.init`.
+    experts_per_layer: u32 = 0,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
@@ -1231,6 +1245,20 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+    }
+
+    // Expert streaming is a runtime switch (main.zig set the globals from the
+    // CLI/env before any config was parsed). Honor it only for qwen4_exp — the
+    // disk-slot-pool machinery is arch-specific; on any other arch the flag is
+    // ignored (and named, so a misplaced --expert-stream isn't silently dead).
+    if (expert_stream_requested) {
+        if (config.isQwen4()) {
+            config.expert_stream = true;
+            config.expert_pool_gb = expert_pool_gb_req;
+            config.experts_per_layer = experts_per_layer_req;
+        } else {
+            log.warn("--expert-stream requested for a non-qwen4 model ({s}); ignored\n", .{config.model_type});
+        }
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -3638,6 +3666,21 @@ pub fn loadSafetensorsFile(
 /// `load_vision` is set. MTP-style head tensors (`*.mtp.*`) on Qwen3.5/3.6
 /// checkpoints are kept (the binder ignores them, but the loader doesn't
 /// need to know that).
+/// Process-wide expert-streaming REQUEST (set by main.zig from the CLI flags /
+/// MLX_SERVE_EXPERT_STREAM before any config is parsed). `parseConfig` promotes
+/// them onto each qwen4 `ModelConfig`; non-qwen4 models never see them.
+pub var expert_stream_requested: bool = false;
+pub var expert_pool_gb_req: u32 = 16;
+pub var experts_per_layer_req: u32 = 0;
+
+/// Process-wide qwen4 expert-streaming load gate. `shouldKeepWeightKey` reads it
+/// at load time (it has no config in hand); the serve/offline callers set it from
+/// `config.expert_stream` immediately before `loadWeights` and clear it after, so
+/// a later non-streaming load is never affected. When true, the trunk routed-expert
+/// banks (`model.layers.{d}.mlp.switch_mlp.*`, never `mtp.*`) are NOT put into the
+/// weights map — `SlotPool` re-reads them from the safetensors headers on demand.
+pub var g_expert_stream: bool = false;
+
 pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // Gemma 4 12B `gemma4_unified` is encoder-free: it ships a tiny vision
     // patch embedder (`vision_embedder.*` + `embed_vision.*`) and a raw-waveform
@@ -3675,6 +3718,10 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         // `model.visual.` (pure rename of `vision_tower.`).
         std.mem.startsWith(u8, key, "model.visual."))) return false;
     if (is_vision and !load_vision) return false;
+    // qwen4 expert streaming: the trunk routed-expert banks are streamed from
+    // disk by SlotPool, so they must never enter the weights map. `isTrunkSwitchKey`
+    // deliberately keeps `mtp.*` (the draft layer's own resident expert set).
+    if (g_expert_stream and expert_store.isTrunkSwitchKey(key)) return false;
     return true;
 }
 

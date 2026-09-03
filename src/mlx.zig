@@ -217,6 +217,10 @@ pub extern "c" fn mlx_broadcast_to(res: *mlx_array, a: mlx_array, shape: [*]cons
 
 pub extern "c" fn mlx_take(res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_take_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+// Scatter `updates` into `a` at `indices` (a vector of per-axis index arrays) along
+// `axes`. Used by the expert slot pool to write N freshly-read expert records into
+// N chosen slots in one op; relies on MLX buffer donation for in-place writes.
+pub extern "c" fn mlx_scatter(res: *mlx_array, a: mlx_array, indices: mlx_vector_array, updates: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_pad(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, low_pad: [*]const c_int, low_pad_num: usize, high_pad: [*]const c_int, high_pad_num: usize, pad_value: mlx_array, mode: [*:0]const u8, s: mlx_stream) c_int;

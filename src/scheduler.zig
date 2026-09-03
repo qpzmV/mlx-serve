@@ -42,6 +42,7 @@ const mtp_mod = @import("mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
+const expert_store = @import("expert_store.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -1107,6 +1108,20 @@ pub const UnloadRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+/// qwen4_exp expert-slot-pool relief valve. Posted by the memory-pressure
+/// watchdog when available RAM dips under the watermark and a streaming model is
+/// resident with a pool above its floor — shrinking the pool is cheaper than
+/// unloading the whole model. Like `UnloadRequest` it is CONSUMED only on the
+/// single inference thread (the sole mlx caller): `SlotPool.resize` frees and
+/// reallocates MLX arrays, which a second thread must never touch. The watchdog
+/// posts + blocks on `done`, exactly as `unloadModel` does.
+pub const PoolResizeRequest = struct {
+    target_slots: u32,
+    done: bool = false,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
 /// state — Transformer + weights + vision encoder + drafter all live here,
@@ -1236,6 +1251,10 @@ pub const Scheduler = struct {
     /// after marking the entry `.evicting` + draining its refcount; the
     /// inference thread frees the mlx state (stream-bound, like cleanup).
     unload_queue: std.ArrayList(*UnloadRequest),
+    /// Pending expert-slot-pool shrinks (qwen4_exp streaming). The memory-pressure
+    /// watchdog posts here; the inference thread consumes it at the TOP of a tick,
+    /// BEFORE any load, so pressure is relieved before a new model allocates.
+    pool_resize_queue: std.ArrayList(*PoolResizeRequest),
     /// Slots awaiting cleanup. The conn thread queues a slot here in
     /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
     /// frees mlx_arrays via refcount-decrement, and the underlying GPU
@@ -1371,6 +1390,7 @@ pub const Scheduler = struct {
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .gen_queue = std.ArrayList(*GenRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
+            .pool_resize_queue = std.ArrayList(*PoolResizeRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
@@ -1478,6 +1498,13 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.unload_queue.deinit(self.allocator);
+        for (self.pool_resize_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.pool_resize_queue.deinit(self.allocator);
 
         // Plan 05: mlx-allocating state lives on the `LoadedModel` owned by
         // the registry. We can't free the entries here (registry teardown
@@ -1947,6 +1974,36 @@ pub const Scheduler = struct {
             // unloads every `.ready`/`.evicting` entry, so it's still freed.
             if (self.shutdown.load(.acquire)) return error.Shutdown;
             try self.unload_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+    }
+
+    /// A halved target for the expert slot pool, or null if there is nothing to
+    /// shrink (no resident streaming model, or already at the CLOCK floor). The
+    /// memory-pressure watchdog calls this BEFORE evicting a whole model: shrinking
+    /// the pool is the cheaper pressure relief when the pool is the thing that
+    /// pushed available RAM under the watermark.
+    pub fn expertPoolShrinkTarget(self: *Scheduler) ?u32 {
+        const x = self.xfm orelse return null;
+        const pool = x.expert_pool orelse return null;
+        const floor = expert_store.POOL_FLOOR_EXPERTS_PER_LAYER *| pool.store.num_layers;
+        if (pool.slots <= floor) return null;
+        return @max(pool.slots / 2, floor);
+    }
+
+    /// Ask the inference thread to resize the resident expert pool to
+    /// `target_slots`, blocking until done (mirrors `unloadModel`: the watchdog
+    /// thread never touches mlx — it posts to `pool_resize_queue` and waits).
+    pub fn shrinkExpertPool(self: *Scheduler, target_slots: u32) !void {
+        var req = PoolResizeRequest{ .target_slots = target_slots };
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.pool_resize_queue.append(self.allocator, &req);
             self.queue_cond.broadcast(self.io);
         }
         req.done_mu.lockUncancelable(self.io);
@@ -2758,6 +2815,50 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+/// Resident RAM a qwen4_exp expert-STREAMING load actually needs: the non-expert
+/// weights (attn/gdn/hc/ple/emb/lm_head/router/shared + the resident MTP head)
+/// plus the slot pool. The 48 trunk expert banks (~77 GB) stay on disk, so
+/// billing the full on-disk size — what the non-streaming preflight does — wrongly
+/// refuses a load that fits in ~20 GB. The per-expert record is recomputed from
+/// config geometry (never hard-coded): 3 packed weight blocks (3·ff·h·bits/8) +
+/// three scale/bias pairs (12·ff·h/group_size for affine bf16 side tensors).
+/// MTP is excluded from `expert_total` (it stays resident, counted in non-expert).
+pub fn expertStreamResidentBytes(
+    num_hidden_layers: u32,
+    num_experts: u32,
+    hidden: u32,
+    moe_inter: u32,
+    bits: u32,
+    group_size: u32,
+    pool_gb: u32,
+    experts_per_layer: u32,
+    disk_bytes: u64,
+) u64 {
+    if (hidden == 0 or moe_inter == 0 or num_experts == 0 or group_size == 0) return disk_bytes;
+    const w: u64 = 3 * @as(u64, moe_inter) * hidden * bits / 8;
+    const s: u64 = 12 * @as(u64, moe_inter) * hidden / group_size;
+    const record = w + s;
+    const expert_total = @as(u64, num_hidden_layers) * num_experts * record;
+    const non_expert = disk_bytes -| expert_total;
+    const pool: u64 = if (experts_per_layer > 0)
+        @as(u64, experts_per_layer) * num_hidden_layers * record
+    else
+        @as(u64, pool_gb) * 1_000_000_000;
+    return non_expert + pool;
+}
+
+test "expertStreamResidentBytes recomputes the Vontra gs32 record and drops the trunk experts" {
+    const disk: u64 = 113_210_000_000; // 113.2 GB(dec) safetensors incl. 77 GB trunk experts
+    const got = expertStreamResidentBytes(48, 512, 2560, 640, 4, 32, 16, 0, disk);
+    // record = 3·640·2560·4/8 + 12·640·2560/32 = 2_457_600 + 614_400 = 3_072_000
+    const record: u64 = 3_072_000;
+    const expect = (disk - 48 * 512 * record) + 16 * 1_000_000_000;
+    try std.testing.expectEqual(expect, got);
+    // The trunk experts (48·512·record ≈ 75.5 GB) are dropped and a 16 GB pool is
+    // added back, so the streaming load bills well under the on-disk footprint.
+    try std.testing.expect(got < disk);
+    try std.testing.expect(disk - got > 40 * 1_000_000_000);
+}
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3186,7 +3287,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
-        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const disk_bytes = modelDiskBytes(sch.io, params.model_dir);
+        // qwen4_exp expert streaming: the trunk expert banks stay on disk, so
+        // bill the real resident set (non-expert + pool), not the ~105 GB
+        // footprint — otherwise a cold load is refused while any other model is
+        // resident even though it needs only ~20 GB.
+        const weights_bytes = if (params.config.expert_stream)
+            expertStreamResidentBytes(
+                params.config.num_hidden_layers,
+                params.config.num_experts,
+                params.config.hidden_size,
+                params.config.moe_intermediate_size,
+                params.config.quant_bits,
+                params.config.quant_group_size,
+                params.config.expert_pool_gb,
+                params.config.experts_per_layer,
+                disk_bytes,
+            )
+        else
+            disk_bytes;
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
@@ -3214,12 +3333,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // Weights — first mlx call. Binds the stream on this thread.
+    // qwen4_exp expert streaming: flip the load gate so `shouldKeepWeightKey`
+    // drops the trunk routed-expert banks (the SlotPool streams them from disk).
+    // Loads run only on this thread, so set→load→clear needs no lock.
+    model_mod.g_expert_stream = params.config.expert_stream;
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
     weights_ptr.* = if (params.load_vision)
         try model_mod.loadWeightsWithVision(sch.io, sch.allocator, params.model_dir)
     else
         try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
+    model_mod.g_expert_stream = false;
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
@@ -3829,7 +3953,20 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ins), else fall back to a rough multiple of layers × hidden. The
     // value drives LRU eviction's "will the new model fit?" gate in Phase
     // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
+    const bytes_resident: u64 = if (params.config.expert_stream) blk: {
+        const disk = entry.bytes_on_disk orelse modelDiskBytes(sch.io, params.model_dir);
+        break :blk expertStreamResidentBytes(
+            params.config.num_hidden_layers,
+            params.config.num_experts,
+            params.config.hidden_size,
+            params.config.moe_intermediate_size,
+            params.config.quant_bits,
+            params.config.quant_group_size,
+            params.config.expert_pool_gb,
+            params.config.experts_per_layer,
+            disk,
+        );
+    } else if (entry.bytes_on_disk) |b|
         b
     else
         @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
@@ -3858,7 +3995,10 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.cleanup_queue.items.len > 0 or
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
-        sch.unload_queue.items.len > 0;
+        sch.unload_queue.items.len > 0 or
+        // Expert-streaming relief valve (develop): a posted pool shrink must
+        // wake the parked loop, same contract as unload_queue.
+        sch.pool_resize_queue.items.len > 0;
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
@@ -3921,6 +4061,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // synchronously, blocking decode for its duration.
         var gen_req: ?*GenRequest = null;
         var unload_req: ?*UnloadRequest = null;
+        var pool_req: ?*PoolResizeRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
@@ -3944,6 +4085,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             }
             if (sch.gen_queue.items.len > 0) {
                 gen_req = sch.gen_queue.orderedRemove(0);
+            }
+            if (sch.pool_resize_queue.items.len > 0) {
+                pool_req = sch.pool_resize_queue.orderedRemove(0);
             }
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
@@ -3970,6 +4114,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
         }
+        if (pool_req) |req| runPoolResize(sch, req);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (gen_req) |req| runGenRequest(sch, req);
@@ -4391,6 +4536,38 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
     }
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+/// qwen4_exp expert-pool relief valve, executed on the SINGLE inference thread
+/// (the sole mlx caller) — the watchdog only posts. Shrinks the resident pool to
+/// `target_slots`; a `resize` is cold (contents + map dropped), and the FOLLOWING
+/// `mlx_clear_cache()` is what actually returns the freed MLX buffers to the OS
+/// (without it, available RAM never recovers and the watchdog exits anyway).
+fn runPoolResize(sch: *Scheduler, req: *PoolResizeRequest) void {
+    if (sch.xfm) |x| {
+        if (x.expert_pool) |pool| {
+            if (pool.slots != req.target_slots) {
+                const before = pool.slots;
+                pool.unpinAll();
+                pool.resize(req.target_slots) catch |err| {
+                    log.err("[expert] relief-valve resize to {d} slots failed: {s}\n", .{ req.target_slots, @errorName(err) });
+                };
+                if (pool.slots != before) {
+                    _ = mlx.mlx_clear_cache();
+                    logWiredPolicy(mlx.applyWiredPolicy());
+                    log.warn("[expert] relief valve: pool {d} → {d} slots ({d:.2} GiB reclaimed)\n", .{
+                        before,
+                        pool.slots,
+                        @as(f64, @floatFromInt((before -| pool.slots) *| pool.store.record_bytes)) / 1_073_741_824.0,
+                    });
+                }
+            }
+        }
+    }
+    req.done_mu.lockUncancelable(sch.io);
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+    req.done_mu.unlock(sch.io);
 }
 
 /// Run one media-generation job on the inference thread. The job body

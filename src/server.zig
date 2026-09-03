@@ -8374,6 +8374,17 @@ fn memPressureWatchdogLoop(ctx: MemPressureCtx) void {
             .none => {},
             .evict => {
                 const sch = global_scheduler orelse continue;
+                // qwen4_exp expert streaming relief valve: if a streaming model is
+                // resident with a pool above the CLOCK floor, shrink the pool
+                // (cheaper than losing the whole model) and re-measure next tick.
+                // The resize runs on the inference thread; this thread only posts.
+                if (sch.expertPoolShrinkTarget()) |target| {
+                    log.warn("[mem-pressure] shrinking expert slot pool to {d} slots before evicting a model\n", .{target});
+                    sch.shrinkExpertPool(target) catch |err| {
+                        log.err("[mem-pressure] expert pool shrink failed: {}\n", .{err});
+                    };
+                    continue;
+                }
                 // Pick the victim under the registry lock, then dupe its id so
                 // nothing can free the entry out from under us after unlock.
                 sch.registry.mutex.lockUncancelable(sch.io);
