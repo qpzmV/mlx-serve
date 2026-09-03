@@ -311,6 +311,8 @@ pub const SlotPool = struct {
     s: mlx.mlx_stream,
     store: *ExpertStore,
     slots: u32,
+    /// Persistent bounded-parallelism pread workers (fills are disk-bound).
+    rd: *ReadPool,
 
     pools: [PIECES]mlx.mlx_array = undefined,
 
@@ -330,6 +332,21 @@ pub const SlotPool = struct {
     fill_ops: u64 = 0,
     io_bytes: u64 = 0,
     fill_ns: u64 = 0,
+    /// Cumulative ns spent ONLY in readPiece() preads (disk). Compare against
+    /// fill_ns (read+scatter+sync) to see whether the fill is disk-bound or
+    /// scatter/sync-bound — that decides the next optimization (QD-parallel disk
+    /// IO vs less GPU serialization).
+    disk_read_ns: u64 = 0,
+    /// Donation probe: active-memory delta around a single scatter+eval. With
+    /// buffer donation working this is ~0 (only touched rows written); if it reads
+    /// pool-block-sized (~1 GB), scatter regressed to a whole-pool copy. Only
+    /// sampled when `sample_stats` (MLX_SERVE_EXPERT_STATS>0) — otherwise zero-cost.
+    last_fill_peak_bytes: u64 = 0,
+    /// Sum of every sampled scatter's active-memory delta across all 9 banks —
+    /// if donation worked this stays ~0; if it is ~N×(pool-block size) then N
+    /// banks are doing a whole-block copy per fill.
+    fill_copy_bytes: u64 = 0,
+    sample_stats: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -344,7 +361,15 @@ pub const SlotPool = struct {
             .s = s,
             .store = store,
             .slots = slots,
+            .rd = undefined,
             .map = std.AutoHashMap(u64, u32).init(allocator),
+            .sample_stats = envInt("MLX_SERVE_EXPERT_STATS") > 0,
+        };
+        // Create the pread workers BEFORE registering errdefer self.deinit(): if
+        // this fails, self.rd is still undefined and deinit would destroy it.
+        self.rd = ReadPool.create() catch |err| {
+            allocator.destroy(self);
+            return err;
         };
         errdefer self.deinit();
 
@@ -368,6 +393,7 @@ pub const SlotPool = struct {
 
     pub fn deinit(self: *SlotPool) void {
         const a = self.allocator;
+        self.rd.destroy();
         for (&self.pools) |*arr| {
             if (arr.ctx != null) _ = mlx.mlx_array_free(arr.*);
         }
@@ -443,32 +469,74 @@ pub const SlotPool = struct {
 
         const fill_io = std.Io.Threaded.global_single_threaded.io();
         const fill_t0 = std.Io.Timestamp.now(fill_io, .awake);
-        for (0..PIECES) |p| {
-            const rb = self.store.piece_row_bytes[p];
-            const staging = try a.alloc(u8, nm * rb);
-            defer a.free(staging);
-            if (!self.store.readPiece(layer, p, miss_experts[0..nm], staging)) return error.IoReadFailed;
 
+        // PHASE 1 — parallel disk read. Allocate one staging per piece, then fan
+        // all PIECES*nm preads across the ReadPool workers (serial pread was ~71%
+        // of fill time). Staging rows are row-major by miss order so the scatter
+        // below relabels them without a data move.
+        var stagings: [PIECES][]u8 = undefined;
+        var n_staged: usize = 0;
+        while (n_staged < PIECES) : (n_staged += 1) {
+            stagings[n_staged] = a.alloc(u8, nm * self.store.piece_row_bytes[n_staged]) catch |err| {
+                for (stagings[0..n_staged]) |sbuf| a.free(sbuf);
+                return err;
+            };
+        }
+        defer for (&stagings) |*sp| a.free(sp.*);
+
+        var tasks = try a.alloc(ReadTask, PIECES * nm);
+        defer a.free(tasks);
+        var ti: usize = 0;
+        for (0..PIECES) |p| {
             const r = self.store.refs[layer * PIECES + p];
-            // MLX general scatter wants updates.ndim == a.ndim + indices.ndim:
-            // for a 1-D [nm] index that is [nm, 1, d1, d2] — the singleton axis
-            // mlx_scatter_args_array inserts (indices.shape ++ [1] ++ src.shape[1:]).
-            // The staging bytes are contiguous and row-major by miss order, so
-            // this is a pure shape relabel, not a data move.
+            const rb = r.row_bytes;
+            const fd = self.store.shards[r.shard].fd;
+            for (0..nm) |i| {
+                tasks[ti] = .{
+                    .fd = fd,
+                    .off = r.byte_offset + @as(u64, miss_experts[i]) * rb,
+                    .dst = stagings[p].ptr + i * rb,
+                    .len = rb,
+                };
+                ti += 1;
+            }
+        }
+        const rd_t0 = std.Io.Timestamp.now(fill_io, .awake);
+        if (!self.rd.run(tasks)) return error.IoReadFailed;
+        const disk_ns: u64 = @intCast(rd_t0.untilNow(fill_io, .awake).nanoseconds);
+
+        // PHASE 2 — scatter each staging into its pool bank. Donation keeps this an
+        // in-place row write; freeing our pool handle before eval leaves the graph
+        // the sole owner so is_donatable() can be true (no whole-block copy).
+        for (0..PIECES) |p| {
+            const r = self.store.refs[layer * PIECES + p];
             const upd_shape = [_]c_int{ @intCast(nm), 1, @intCast(r.d1), @intCast(r.d2) };
-            const updates = mlx.mlx_array_new_data(staging.ptr, &upd_shape, upd_shape.len, r.dtype);
+            const updates = mlx.mlx_array_new_data(stagings[p].ptr, &upd_shape, upd_shape.len, r.dtype);
             defer _ = mlx.mlx_array_free(updates);
+
+            var probe_base: usize = 0;
+            if (self.sample_stats) {
+                _ = mlx.mlx_array_eval(self.pools[p]); // commit current pool first
+                _ = mlx.mlx_get_active_memory(&probe_base);
+                _ = mlx.mlx_reset_peak_memory();
+            }
 
             const axes = [_]c_int{0};
             var updated = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_scatter(&updated, self.pools[p], idx_vec, updates, &axes, 1, self.s));
-            // Force the op NOW (staging/updates still alive), then donate-swap the
-            // pool handle: old freed, `updated` is the sole reference for next fill.
-            try mlx.check(mlx.mlx_array_eval(updated));
             _ = mlx.mlx_array_free(self.pools[p]);
+            try mlx.check(mlx.mlx_array_eval(updated));
+            if (self.sample_stats) {
+                var probe_peak: usize = 0;
+                _ = mlx.mlx_get_peak_memory(&probe_peak);
+                const transient = probe_peak -| probe_base; // extra bytes alive at peak
+                self.last_fill_peak_bytes = @max(self.last_fill_peak_bytes, transient);
+                self.fill_copy_bytes += transient;
+            }
             self.pools[p] = updated;
         }
         self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
+        self.disk_read_ns += disk_ns;
         self.fill_ops += nm;
         self.io_bytes += nm * self.store.record_bytes;
 
@@ -528,6 +596,99 @@ pub const SlotPool = struct {
     }
 };
 
+/// One pread task for the parallel reader.
+const ReadTask = struct {
+    fd: std.c.fd_t,
+    off: u64,
+    dst: [*]u8,
+    len: usize,
+};
+
+/// Persistent bounded-parallelism pread workers. `SlotPool.ensure` is disk-bound
+/// (serial pread ≈ 71% of fill time), so we fan the 9×nm per-fill reads across a
+/// small fixed thread set instead of issuing them one after another. The workers
+/// are long-lived (created once with the pool, joined on deinit) — spawning a
+/// fresh thread per read would cost more than the read itself. The pattern
+/// (generation counter + condvar wake + strided fan-out + spin-wait on a pending
+/// count) mirrors `PrefetchPool` in qwen4_exp.zig.
+pub const ReadPool = struct {
+    const N = 8; // queue depth; handoff notes QD8≈17GB/s, QD1≈9.5GB/s on this SSD
+    mu: std.Io.Mutex = .init,
+    cv: std.Io.Condition = .init,
+    gen: u64 = 0,
+    quit: bool = false,
+    tasks: []const ReadTask = &.{},
+    pending: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(u32) = .init(0),
+    threads: [N]std.Thread = undefined,
+
+    fn create() !*ReadPool {
+        const a = std.heap.page_allocator;
+        const p = try a.create(ReadPool);
+        p.* = .{};
+        var started: usize = 0;
+        errdefer {
+            p.shutdown(started);
+            a.destroy(p);
+        }
+        for (0..N) |i| {
+            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
+            started += 1;
+        }
+        return p;
+    }
+
+    fn destroy(self: *ReadPool) void {
+        self.shutdown(N);
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn shutdown(self: *ReadPool, started: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.quit = true;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        for (self.threads[0..started]) |t| t.join();
+    }
+
+    /// Run all `tasks` in parallel; block until done; false if any pread failed.
+    fn run(self: *ReadPool, tasks: []const ReadTask) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        self.tasks = tasks;
+        self.failed.store(0, .release);
+        self.pending.store(N, .release);
+        self.gen += 1;
+        self.cv.broadcast(io);
+        self.mu.unlock(io);
+        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        return self.failed.load(.acquire) == 0;
+    }
+
+    fn worker(self: *ReadPool, idx: usize) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen: u64 = 0;
+        while (true) {
+            self.mu.lockUncancelable(io);
+            while (self.gen == seen and !self.quit) self.cv.wait(io, &self.mu) catch {};
+            if (self.quit) {
+                self.mu.unlock(io);
+                return;
+            }
+            seen = self.gen;
+            const tasks = self.tasks;
+            self.mu.unlock(io);
+            var i = idx;
+            while (i < tasks.len) : (i += N) {
+                const t = tasks[i];
+                if (!preadFull(t.fd, t.dst[0..t.len], t.off)) _ = self.failed.fetchAdd(1, .acq_rel);
+            }
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+};
+
 // ── helpers ──
 
 fn preadFull(fd: std.c.fd_t, dst: []u8, offset: u64) bool {
@@ -538,6 +699,11 @@ fn preadFull(fd: std.c.fd_t, dst: []u8, offset: u64) bool {
         done += @intCast(rc);
     }
     return true;
+}
+
+fn envInt(name: [*:0]const u8) i64 {
+    const raw = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch 0;
 }
 
 fn readFileAlloc(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]u8 {
