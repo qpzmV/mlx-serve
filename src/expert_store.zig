@@ -505,36 +505,47 @@ pub const SlotPool = struct {
         if (!self.rd.run(tasks)) return error.IoReadFailed;
         const disk_ns: u64 = @intCast(rd_t0.untilNow(fill_io, .awake).nanoseconds);
 
-        // PHASE 2 — scatter each staging into its pool bank. Donation keeps this an
-        // in-place row write; freeing our pool handle before eval leaves the graph
-        // the sole owner so is_donatable() can be true (no whole-block copy).
+        // PHASE 2 — build all 9 scatters, then ONE batched eval. Each bank used to
+        // force its own eval() (9 GPU↔CPU sync barriers per fill, ×48 layers on the
+        // decode critical path). Batching to one mlx_eval over the 9 outputs cuts
+        // 8 barriers/fill. Donation still fires per bank: freeing OUR pool handle
+        // right after its scatter leaves that Scatter op's graph as the sole owner
+        // of the pool buffer, so is_donatable() is true at eval → out shares it
+        // (no whole-block copy). `updates` (host→MLX wrappers) and `stagings` must
+        // outlive the batched eval; updates freed after it, stagings at fn end.
+        var probe_base: usize = 0;
+        if (self.sample_stats) {
+            for (0..PIECES) |pp| _ = mlx.mlx_array_eval(self.pools[pp]); // commit all banks
+            _ = mlx.mlx_get_active_memory(&probe_base);
+            _ = mlx.mlx_reset_peak_memory();
+        }
+
+        var updateds: [PIECES]mlx.mlx_array = undefined;
+        var updates_arr: [PIECES]mlx.mlx_array = undefined;
+        const axes = [_]c_int{0};
         for (0..PIECES) |p| {
             const r = self.store.refs[layer * PIECES + p];
             const upd_shape = [_]c_int{ @intCast(nm), 1, @intCast(r.d1), @intCast(r.d2) };
             const updates = mlx.mlx_array_new_data(stagings[p].ptr, &upd_shape, upd_shape.len, r.dtype);
-            defer _ = mlx.mlx_array_free(updates);
-
-            var probe_base: usize = 0;
-            if (self.sample_stats) {
-                _ = mlx.mlx_array_eval(self.pools[p]); // commit current pool first
-                _ = mlx.mlx_get_active_memory(&probe_base);
-                _ = mlx.mlx_reset_peak_memory();
-            }
-
-            const axes = [_]c_int{0};
+            updates_arr[p] = updates;
             var updated = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_scatter(&updated, self.pools[p], idx_vec, updates, &axes, 1, self.s));
-            _ = mlx.mlx_array_free(self.pools[p]);
-            try mlx.check(mlx.mlx_array_eval(updated));
-            if (self.sample_stats) {
-                var probe_peak: usize = 0;
-                _ = mlx.mlx_get_peak_memory(&probe_peak);
-                const transient = probe_peak -| probe_base; // extra bytes alive at peak
-                self.last_fill_peak_bytes = @max(self.last_fill_peak_bytes, transient);
-                self.fill_copy_bytes += transient;
-            }
-            self.pools[p] = updated;
+            _ = mlx.mlx_array_free(self.pools[p]); // graph is now sole owner → eval donates
+            updateds[p] = updated;
         }
+        const out_vec = mlx.mlx_vector_array_new_data(&updateds, PIECES);
+        defer _ = mlx.mlx_vector_array_free(out_vec);
+        try mlx.check(mlx.mlx_eval(out_vec)); // ONE barrier for all 9 banks
+        for (&updates_arr) |u| _ = mlx.mlx_array_free(u);
+
+        if (self.sample_stats) {
+            var probe_peak: usize = 0;
+            _ = mlx.mlx_get_peak_memory(&probe_peak);
+            const transient = probe_peak -| probe_base; // extra bytes alive at peak
+            self.last_fill_peak_bytes = @max(self.last_fill_peak_bytes, transient);
+            self.fill_copy_bytes += transient;
+        }
+        for (0..PIECES) |p| self.pools[p] = updateds[p];
         self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
         self.disk_read_ns += disk_ns;
         self.fill_ops += nm;
