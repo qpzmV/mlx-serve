@@ -332,6 +332,10 @@ pub const SlotPool = struct {
     fill_ops: u64 = 0,
     io_bytes: u64 = 0,
     fill_ns: u64 = 0,
+    /// Cumulative ns spent ONLY in the batched mlx_eval(out_vec) (the one GPU
+    /// full-device sync per fill) — split out of fill_ns so we can see how much of
+    /// the non-disk fill time is that sync vs the scatter graph build.
+    eval_ns: u64 = 0,
     /// Cumulative ns spent ONLY in readPiece() preads (disk). Compare against
     /// fill_ns (read+scatter+sync) to see whether the fill is disk-bound or
     /// scatter/sync-bound — that decides the next optimization (QD-parallel disk
@@ -535,7 +539,9 @@ pub const SlotPool = struct {
         }
         const out_vec = mlx.mlx_vector_array_new_data(&updateds, PIECES);
         defer _ = mlx.mlx_vector_array_free(out_vec);
+        const ev_t0 = std.Io.Timestamp.now(fill_io, .awake);
         try mlx.check(mlx.mlx_eval(out_vec)); // ONE barrier for all 9 banks
+        self.eval_ns += @intCast(ev_t0.untilNow(fill_io, .awake).nanoseconds);
         for (&updates_arr) |u| _ = mlx.mlx_array_free(u);
 
         if (self.sample_stats) {

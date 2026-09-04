@@ -24410,9 +24410,10 @@ fn expert_stats_tick(pool: *expert_store.SlotPool) void {
     const per_fill_us = @as(f64, @floatFromInt(pool.fill_ns)) / 1_000.0 / @as(f64, @floatFromInt(@max(@as(u64, 1), pool.fill_ops)));
     const copy_per_fill_gb = @as(f64, @floatFromInt(pool.fill_copy_bytes)) / 1_000_000_000.0 / @as(f64, @floatFromInt(@max(@as(u64, 1), pool.fill_ops)));
     const disk_us = @as(f64, @floatFromInt(pool.disk_read_ns)) / 1_000.0 / @as(f64, @floatFromInt(@max(@as(u64, 1), pool.fill_ops)));
-    log.info("[expert] stats visits={d} hits={d} misses={d} hit={d:.3} fill_ops={d} io={d:.1}MB per_fill={d:.1}us disk={d:.1}us copy_per_fill={d:.2}GB\n", .{
+    const eval_us = @as(f64, @floatFromInt(pool.eval_ns)) / 1_000.0 / @as(f64, @floatFromInt(@max(@as(u64, 1), pool.fill_ops)));
+    log.info("[expert] stats visits={d} hits={d} misses={d} hit={d:.3} fill_ops={d} io={d:.1}MB per_fill={d:.1}us disk={d:.1}us eval={d:.1}us copy_per_fill={d:.2}GB\n", .{
         S.calls, pool.hits, pool.misses, pool.hitRate(), pool.fill_ops,
-        @as(f64, @floatFromInt(pool.io_bytes)) / 1_000_000.0, per_fill_us, disk_us, copy_per_fill_gb,
+        @as(f64, @floatFromInt(pool.io_bytes)) / 1_000_000.0, per_fill_us, disk_us, eval_us, copy_per_fill_gb,
     });
 }
 
