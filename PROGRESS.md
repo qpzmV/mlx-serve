@@ -36,29 +36,38 @@
 6. **`switch_*` 流式绑 null**（不是绑池块）：绑池块会多一层引用、破坏 buffer 捐赠→每次 ensure 退化成整池拷贝（16GB≈60ms，decode 废）；绑 null 还能让加载末尾的 `appendHybridMlpWeights` 自动跳过专家。
 7. 真实 `MoeMlpWeights` 是 `switch_gate_w/s/b…` 量化布局，**根本没有** `experts.{i}.gate_w` 三元组——上一版的前提不存在，且它用 `mlx_array_new_data(&pool,null,dtype,shape,len)`（5 参）调用，签名对不上，从没编译过。
 
-## 待你在真机验证（Step 6 运行时项，AI 不代跑高影响操作）
+## 性能调优历程（Vontra / 128GB / temp=0 / 256-token 长请求，本机实测）
 
-```
-# 1) 冒烟 + [expert] pool 日志 + 不 OOM
-./zig-out/bin/mlx-serve serve --model ~/.mlx-serve/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit \
-    --port 8001 --expert-stream --expert-pool-gb 16
-#   期望日志：[expert] pool 5208 slots (…GiB), 48 layers, 3.072MB/record, …
-#   MLX 常驻 ≈ 非专家(~36GB safetensors 非专家部分) + 16GB 池，不 OOM
+| 里程碑 | 关键改动 | decode tok/s |
+|---|---|---|
+| 初接通（有隐性 bug） | 全局槽池 + 重映射 + 散射 | **0.38** |
+| `9a44e5f` 捐赠修复 | scatter 后**先释放我方池句柄再 eval**（`is_donatable` 才为真，输出复用池 buffer 不整块拷）→ `copy_per_fill 2.79GB→0` | **3.50** |
+| `9a44e5f` QD 读盘 | 持久化 `ReadPool`(8 线程) 并行下发 9×nm 个 pread → `disk 1.53ms→0.39ms` | **8.95** |
+| `2861671` 批量 eval | 9 块 scatter 合并为**一次** `mlx_eval`（每 fill 9 次 GPU 同步 barrier→1） | **12.9** |
+| 池调优（无代码改动） | `--expert-pool-gb` 16→48（命中 0.82→0.90，miss −42%） | **19.0** |
 
-# 2) golden equivalence（30 vs 181 专家/层，贪心输出逐字节一致）+ 吞吐哨兵
-BIN=./zig-out/bin/mlx-serve PORT=8001 bash tests/test_expert_streaming.sh
+**当前落点：单流 ~19 tok/s（进入 slotstream 12–20 参照带）；4 路并发聚合 37.5 tok/s。**
 
-# 3) 压力互锁（不制造真实内存压力）：MLX_SERVE_MEM_PROBE_FILE 注入
-#    期望：低压先 "shrinking expert slot pool to …"，不先 "evicting idle resident model"；
-#    缩到下限仍低压 30s 才 exit(0)
-```
+`per_fill` 拆分（48GB 稳态，`MLX_SERVE_EXPERT_STATS` 实测）：总 690us = **disk 407us（59%）+ 批量 eval 146us（21%）+ scatter建图/host→dev 138us**。→ 同步已很便宜，剩余大头是真·读盘延迟。
+
+## 实测结论（原"待验证"三项）
+
+- **golden-equivalence（池大小不改数学）**：⚠️ 本构建 **temp=0 贪心本身非确定**——同配置(181/层)冷启动连跑 3 次得到 3 个不同输出（前 ~221 字符一致，在一个近平局 token 上分叉）。跨池(30 vs 181)的分叉位置 = 同配置连跑的分叉位置，说明**发散与池大小无关、非流式 bug**。"逐字节一致"标准在此构建不可达；流式正确性以"确定性前缀完全一致 + 仅在平局处分叉"确认。
+- **压力互锁**：预算钳制生效（启动日志 `budget 76.83 GiB`，请求超预算会 clamp+WARN）；缩池解压阀代码就绪。
+- **内存峰值**（`wired+compressor+anon−purgeable`，看门狗口径）：16GB 池整机峰值 45.7GB（起服务前基线 ~19.6GB → **服务自身 ≈26GB** = 16GB 池 + 非专家/MTP/KV/暂存）；ngram 表 32GB 是可回收 file-backed 页，不计入。⚠️ 之前报的"RSS 3.5GB"是**进程 RSS、不含 Metal/GPU 分配，严重低估**，作废。
+
+## 池大小 sweet spot / 并发 / 预取决策
+
+- **48GB 是甜点**：命中 0.90；64GB 无增益（hit 0.898、miss 与 48GB 逐位相同——该请求活跃专家集 48GB 已装满）。**建议启动写 `--expert-pool-gb 48`**。
+- **并发（系统已有连续批处理）是吞吐正解**：4 路 → 聚合 37.5 tok/s（≈单流 2×），命中升到 **0.961**（多序列共享热专家）。A 读盘时 B/C 的 gather 占 GPU，磁盘等待被天然盖住。
+- **跨层预取：经依赖分析 + 并发实测，决定不做**。原因：(1) L+1 专家集依赖 L+1 路由、路由依赖 L 的 MoE 输出（含 L 读盘）→ 硬串行；(2) 单流 batch=1 时 GPU 等 disk 期间无独立活可重叠；(3) hit 已 0.90 能省的读盘本就少。并发场景已由批处理解决。
 
 ## 已知边界 / 后续可做
 
-- **真机首轮崩溃（已修）**：首帧前向 `mlx_scatter` 报 `Updates with 3 dimensions does not match the sum of the array (3) and indices (1) dimensions`。MLX 通用 scatter 要求 `updates.ndim == a.ndim + indices.ndim`，对一维 `[nm]` 索引即 `[nm,1,d1,d2]`（正是 Python `a[idx]=v` 底层 `mlx_scatter_args_array` 插入的 singleton 轴）。`ensure()` 已把 staging 重塑为 4 维（连续、纯形状重标），ReleaseFast 重建通过、`zig build test` 绿。
-- `readPiece` 现为**串行 pread**（v1，handoff/崩溃日志认定的可接受档：QD1≈9.5GB/s，仅比 QD8 慢 ~1.8×，零线程复杂度）。`MLX_SERVE_EXPERT_IO_QD` 并行化留作性能跟进。
+- `ReadPool` worker 数固定 8（QD8）；`MLX_SERVE_EXPERT_IO_QD` 目前未做成可调（`run` 内 `N=8` 常量）。
 - 流式仅覆盖主干 48 层；MTP 草稿层走常驻（`mcfg.expert_stream=false`），其 1.57GB 惰性物化，已接受。
-- **捐赠退化哨兵现可直接观测**：`MLX_SERVE_EXPERT_STATS=N` 每 N 次流式层访问打印 `hit=… per_fill=…us`。`SlotPool` 已带 `fill_ops/io_bytes/fill_ns` 计数。per_fill 从几十 µs 跳到毫秒级＝buffer 捐赠退化成整池拷贝（golden equivalence 抓不到"只变慢不变错"，这个能抓）。
+- 聚合吞吐到 ~2× 后受 GPU 固有算力（attention/gather）限制，非流式方案可优化范围。
+- 诊断探针 `MLX_SERVE_EXPERT_STATS=N`（默认关、零开销）：每 N 次流式层访问打印 `hit / per_fill / disk / eval / copy_per_fill`。`copy_per_fill>0`＝捐赠退化成整池拷贝（golden 抓不到、这个能抓）。
 
 ## 文件清单
 
