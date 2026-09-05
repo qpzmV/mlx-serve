@@ -78,3 +78,45 @@
 | `tests/test_expert_streaming.sh` | 新建（运行时验收 harness） |
 | `PROGRESS.md` | 本文件（已替换为准确状态） |
 | `expert-streaming-handoff.md` | 只读依据，未改 |
+
+## 2026-09-05 develop 分支：main 基线重建 + 投机解码交互问题定位
+
+### 分支重建
+- 按要求：`develop` = **main 基线** + 完整 feat 链重放（11 commits：mem-pressure 基建 → 流式池 → 三次性能优化 → 诊断探针 → 角色白名单修复）。全部落地，`zig build test` + ReleaseFast 全绿，已 push。
+- `dev` 分支已删（本地+远端）；`feat/mem-pressure-guard` 保留作备份。
+
+### 新发现问题：投机解码 × 专家流式 = 生成损坏（重要）
+干净 develop 基线 + 流式池上系统对照（显式工具指令，temp=1.0）：
+
+| 配置 | 工具调用 |
+|---|---|
+| QSA✗ MTP✗ PLD✗ | **2/3 ✓ 正常** |
+| QSA✗ MTP✓ PLD✓ | 0-1/3 ✗ |
+| QSA✗ MTP✗ PLD✓ | 0/3 ✗ |
+| QSA✓ MTP✓ PLD✓ | 0/3 ✗ |
+
+**结论：任何投机解码（MTP 或 PLD）+ 专家流式池 = 输出中段损坏**（原始字节证据：开头连贯 → 中段零宽字符/mojibake/标签汤，`/tmp/raw4.txt` 样本留存）。机制：投机解码假设一轮 draft+verify 期间权重不变，而流式池每层 ensure 都会散射换池 → spec 链跨换池读到不一致专家 → 验证发散。**架构级交互**，与角色修复无关（pi 标准角色 0 警告触发）。
+
+另：main 的 QSA 三路径（gather/fused/decode-gather）单独开关在 1.2k 小上下文不改变结果（decode-gather 只在 ~45k 大 KV 才 engage）——交互主因是投机解码，QSA 是次要变量（45k 场景叠加）。
+
+### 当前稳定配置（已实测：工具调用干净、内容连贯、25 tok/s @5.7k）
+```bash
+MLX_SERVE_QSA_DECODE_GATHER=0 MLX_SERVE_QSA_GATHER=0 MLX_SERVE_QSA_FUSED=0 MLX_SERVE_NAX_SDPA=0 \
+./zig-out/bin/mlx-serve serve \
+  --model ~/.mlx-serve/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit \
+  --port 11234 --host 127.0.0.1 \
+  --expert-stream --expert-pool-gb 48 \
+  --prefix-cache-mem 16GB \
+  --no-mtp --no-pld
+```
+
+### Codex 客户端配套修复（~/.codex/config.toml + models.json）
+- `base_url` 改回环 `127.0.0.1:11234/v1`（原 frp 公网）；
+- computer-use MCP 绝对路径 + enabled（原相对路径+关闭）；
+- `models.json` Vontra 条目补 `max_output_tokens: 32768`（压 max_out 无限默认；备份 `*.bak-20260905`）；
+- 服务端 `normalizeRole` 白名单（`28f67a4`）修 computer-use 坏角色 jinja 崩溃——Codex 实测 0 jinja 失败。
+
+### 后续（未做）
+1. 投机解码 × 流式池的根因修复（spec 轮内冻结池 / 验证重读一致权重）——架构级工程；
+2. `computer_call_output` 观察翻译进 prompt（computer-use 插件真正可用需此步）；
+3. 二分定位三个 QSA env 中具体哪个与流式交互损坏（45k 场景，~15 分钟/步）。
