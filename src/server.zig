@@ -1144,6 +1144,9 @@ fn parseToolCallsForRequest(
     if (parsed_calls) |c| {
         if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
     }
+    // Repair mangled tool-call names (e.g. '<function=bash" />' parsed as
+    // name 'bash" /') so the client can actually dispatch them.
+    if (parsed_calls) |c| try chat_mod.repairMangledToolNames(allocator, c, tools_json orelse "");
     var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;

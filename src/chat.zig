@@ -4022,6 +4022,41 @@ pub fn toolNameIsDeclared(allocator: std.mem.Allocator, tools_json: []const u8, 
 /// Returns the retained slice (shrunk in place), or null when every call was
 /// dropped — the caller treats that exactly like "no tool calls", so the text
 /// stays visible content and finish_reason (e.g. "length") is preserved.
+/// Repair a MANGLED tool-call name in place. Models emitting a malformed
+/// opener - e.g. the equals-form mixed with a self-closing tag
+/// (`<function=bash" />`) - yield a name like `bash" /` once the parser cuts
+/// to the next `>`. The client can never dispatch that, so the whole agent
+/// turn dies with "Tool ... not found" even though the intent (and often the
+/// args) were recoverable. Strip everything outside tool-name characters
+/// [A-Za-z0-9_.:-] and keep the call ONLY if the cleaned name matches a
+/// declared tool; otherwise leave the call untouched (the caller's schema
+/// filter / client decides).
+pub fn repairMangledToolNames(allocator: std.mem.Allocator, calls: []ParsedToolCall, tools_json: []const u8) !void {
+    for (calls) |*tc| {
+        if (toolNameIsDeclared(allocator, tools_json, tc.name)) continue;
+        var buf = try allocator.dupe(u8, tc.name);
+        var w: usize = 0;
+        for (buf) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == ':') {
+                buf[w] = c;
+                w += 1;
+            }
+        }
+        if (w == 0) {
+            allocator.free(buf);
+            continue;
+        }
+        const cleaned = buf[0..w];
+        if (toolNameIsDeclared(allocator, tools_json, cleaned)) {
+            log.warn("  [tool-parse] repaired mangled tool-call name '{s}' -> '{s}'\n", .{ tc.name, cleaned });
+            const owned = try allocator.dupe(u8, cleaned);
+            allocator.free(tc.name);
+            tc.name = owned;
+        }
+        allocator.free(buf);
+    }
+}
+
 pub fn filterInferredBySchema(
     allocator: std.mem.Allocator,
     calls: []ParsedToolCall,
