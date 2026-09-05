@@ -185,3 +185,24 @@ scheduler 把 in-checkpoint 头挂成 `MtpHeadRef{.qwen4}`、模块回滚谓词�
 2. 编码代理流量（pi/Codex）建议温度 0.6：截断、内容质量（FFT 误解、代码 bug）同源于
    temp=1.0 的过热采样，pi 配置层调温即可；
 3. `[spec-eos]` INFO 日志保留：后续任何"提前停止"投诉可直接看 finisher token id。
+
+## 2026-09-06 Codex computer-use 接通：computer_use_preview 工具翻译 + 截图观察进 prompt
+
+### 机制
+Codex computer-use 插件走 /v1/responses 的托管工具协议（`computer_use_preview`），
+本地模型没有托管工具通道，此前三处断点：tools 丢弃、computer_call/computer_call_output
+输入项丢弃、模型调用无处安放。本次双向打通：
+
+1. **tools 入站**：`computer_use_preview`/`computer_2025*` 翻译成一个普通 function 工具
+   `computer`（action 枚举 + coordinate/text/button/scroll_* 参数），模型按普通工具调用；
+2. **computer_call 出站**：模型的 `computer` 调用改写为 OpenAI `computer_call` 输出项
+   （action 内嵌对象，流式发 item.added/done 事件），Codex 插件识别并执行；
+3. **computer_call_output 入站**：`computer_screenshot` 的 image_url（data URL）走与
+   input_image 相同的视觉通路（Qwen3-VL 塔）解码进 prompt，附一句话说明 + call_id；
+   历史 `computer_call` 回放为 assistant 工具调用，会话可往返。
+
+### 验证
+- 合成两轮回路：R1 模型发 screenshot 调用 → computer_call（action 为内嵌对象）；
+  R2 回填截图 → 模型看见画面 → 发 double_click coordinate:[512,320]（视觉反馈闭环）；
+- 流式 computer_call 事件正常；普通 function 工具与 /v1/chat/completions 工具无回归；
+- 引擎采样/工具链无改动，7813d9b 的截断修复不受影响。

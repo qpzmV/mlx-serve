@@ -191,16 +191,51 @@ pub fn inputContainsFunctionCallOutput(input_val: std.json.Value) bool {
 /// Re-shape Responses tools (`{type:"function", name, parameters, description}`)
 /// into the nested OpenAI form (`{type:"function", function:{name, parameters,
 /// description}}`) that `chat_mod.formatChat` expects. Returns owned JSON.
+/// Computer-use tool types ride OpenAI's hosted-tool naming (`computer_use_preview`
+/// and the dated `computer_YYYYMMDD` variants). Codex's computer-use plugin sends
+/// one of these in `tools`; local models have no hosted-tool channel, so it is
+/// translated into an ordinary `computer` function tool the model can call.
+pub fn isComputerUseToolType(t: []const u8) bool {
+    if (std.mem.eql(u8, t, "computer_use_preview")) return true;
+    if (std.mem.eql(u8, t, "computer_use")) return true;
+    return std.mem.startsWith(u8, t, "computer_2025");
+}
+
+const computer_function_tool_json =
+    "{\"type\":\"function\",\"function\":{\"name\":\"computer\",\"description\":\"Control the user's computer screen. " ++
+    "Supported actions: click, double_click, scroll, type, key, wait, screenshot, move, drag. " ++
+    "`coordinate` is [x, y] pixels for click/double_click/move/drag and the scroll anchor. " ++
+    "`text` carries the keys for `key` (e.g. \\\"Return\\\", \\\"cmd+t\\\") or the string to `type`. " ++
+    "`scroll_direction` is up/down/left/right and `scroll_amount` is the number of clicks. " ++
+    "Always take a screenshot first to see the current screen before acting.\"," ++
+    "\"parameters\":{\"type\":\"object\",\"properties\":{" ++
+    "\"action\":{\"type\":\"string\",\"enum\":[\"click\",\"double_click\",\"scroll\",\"type\",\"key\",\"wait\",\"screenshot\",\"move\",\"drag\"]}," ++
+    "\"coordinate\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"minItems\":2,\"maxItems\":2}," ++
+    "\"text\":{\"type\":\"string\"}," ++
+    "\"button\":{\"type\":\"string\",\"enum\":[\"left\",\"right\",\"wheel\"]}," ++
+    "\"scroll_direction\":{\"type\":\"string\",\"enum\":[\"up\",\"down\",\"left\",\"right\"]}," ++
+    "\"scroll_amount\":{\"type\":\"integer\"}},\"required\":[\"action\"]}}}";
+
 pub fn buildToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '[');
     var emitted: usize = 0;
+    var computer_emitted = false;
     for (tools_array.items) |tool_val| {
         if (tool_val != .object) continue;
         const tool = tool_val.object;
-        // Only function tools are supported locally (web_search/file_search/computer_use are not)
         const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+        // Hosted computer-use tool → one synthesized `computer` function tool.
+        if (isComputerUseToolType(t)) {
+            if (computer_emitted) continue;
+            computer_emitted = true;
+            if (emitted > 0) try buf.append(allocator, ',');
+            emitted += 1;
+            try buf.appendSlice(allocator, computer_function_tool_json);
+            continue;
+        }
+        // Other hosted tools (web_search/file_search/...) remain unsupported.
         if (!std.mem.eql(u8, t, "function")) continue;
 
         if (emitted > 0) try buf.append(allocator, ',');
@@ -392,6 +427,20 @@ pub fn parseInput(
                     try appendFunctionCallInputItem(allocator, &pi, obj);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
                     try appendFunctionCallOutputItem(allocator, &pi, obj);
+                } else if (std.mem.eql(u8, t, "computer_call")) {
+                    // Codex computer-use history replay: the model's earlier
+                    // computer call comes back as input. Map it to the same
+                    // `computer` function tool the tools translation emits, so
+                    // the conversation round-trips (assistant call → its
+                    // `computer_call_output` observation as the next turn).
+                    try appendComputerCallInputItem(allocator, &pi, obj);
+                } else if (std.mem.eql(u8, t, "computer_call_output")) {
+                    // Codex computer-use observation: carries a screenshot of
+                    // the screen AFTER the model's action. The screenshot is
+                    // the model's only feedback channel — decode it through
+                    // the same vision path as `input_image` parts and attach
+                    // it to a user turn (the template's only image channel).
+                    try appendComputerCallOutputItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
                     // Drop on input — model regenerates its own reasoning.
                     continue;
@@ -570,6 +619,139 @@ fn appendFunctionCallOutputItem(
         .content = output,
         .tool_call_id = call_id,
     });
+}
+
+/// History replay of a model-issued `computer_call` item: `{type, call_id,
+/// action: {type: "click", x, y, ...}}`. Becomes an assistant tool call on the
+/// synthesized `computer` function tool, mirroring the tools translation in
+/// `buildToolsJson`, so the following `computer_call_output` pairs with it.
+fn appendComputerCallInputItem(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    obj: std.json.ObjectMap,
+) !void {
+    const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
+    var arguments: []const u8 = "{}";
+    var args_owned: ?[]u8 = null;
+    defer if (args_owned) |a| allocator.free(a);
+    if (obj.get("action")) |action_val| {
+        if (action_val == .object) {
+            var abuf = std.ArrayList(u8).empty;
+            serializeJsonValue(allocator, &abuf, action_val) catch {};
+            args_owned = try abuf.toOwnedSlice(allocator);
+            arguments = args_owned.?;
+        }
+    }
+    const tcs = try allocator.alloc(chat_mod.ToolCall, 1);
+    errdefer allocator.free(tcs);
+    tcs[0] = .{ .id = call_id, .name = "computer", .arguments = arguments };
+    try pi.owned_tool_calls.append(allocator, tcs);
+    try pi.messages.append(allocator, .{
+        .role = "assistant",
+        .content = "",
+        .tool_calls = tcs,
+    });
+}
+
+/// Codex computer-use observation: `{type, call_id, output: {type:
+/// "computer_screenshot", image_url: "data:image/png;base64,..."}}`. The
+/// screenshot IS the action's result — decode it through the same vision path
+/// as `input_image` parts and attach it to a user turn (the chat template's
+/// only image-bearing channel), with a short text so the model knows what the
+/// image is and which call it answers.
+fn appendComputerCallOutputItem(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    obj: std.json.ObjectMap,
+    image_decoder: ?ImageUrlDecoder,
+    vp: chat_mod.VisionPreproc,
+) !void {
+    const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
+    const output_val = obj.get("output");
+
+    var text_buf = std.ArrayList(u8).empty;
+    defer text_buf.deinit(allocator);
+    var image_list = std.ArrayList(chat_mod.ImageData).empty;
+    errdefer {
+        for (image_list.items) |img| allocator.free(img.pixels);
+        image_list.deinit(allocator);
+    }
+
+    switch (output_val orelse .null) {
+        .object => |out| {
+            const ot = if (out.get("type")) |v| (if (v == .string) v.string else "") else "";
+            if (std.mem.eql(u8, ot, "computer_screenshot")) {
+                const url_val = out.get("image_url") orelse out.get("url");
+                const url = switch (url_val orelse .null) {
+                    .string => |s| s,
+                    .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else "") else "",
+                    else => "",
+                };
+                if (url.len > 0) {
+                    if (image_decoder) |dec| dec(allocator, &image_list, url, vp);
+                    try text_buf.appendSlice(allocator, "[computer screenshot — the current screen state after your action]");
+                } else {
+                    try text_buf.appendSlice(allocator, "[computer action completed — no screenshot returned]");
+                }
+            } else {
+                // Unknown output object: surface its type instead of dropping.
+                try text_buf.appendSlice(allocator, "[computer action completed]");
+            }
+        },
+        .string => |s| {
+            // String outputs are plain text results.
+            try text_buf.appendSlice(allocator, s);
+        },
+        else => {
+            try text_buf.appendSlice(allocator, "[computer action completed]");
+        },
+    }
+    if (call_id.len > 0) {
+        try text_buf.appendSlice(allocator, " (call_id: ");
+        try text_buf.appendSlice(allocator, call_id);
+        try text_buf.appendSlice(allocator, ")");
+    }
+
+    const owned = try allocator.dupe(u8, text_buf.items);
+    try pi.owned_strings.append(allocator, owned);
+    var images: ?[]chat_mod.ImageData = null;
+    if (image_list.items.len > 0) {
+        const owned_imgs = try image_list.toOwnedSlice(allocator);
+        try pi.owned_images.append(allocator, owned_imgs);
+        images = owned_imgs;
+    } else {
+        image_list.deinit(allocator);
+    }
+
+    try pi.messages.append(allocator, .{
+        .role = "user",
+        .content = owned,
+        .images = images,
+    });
+}
+
+/// Output-side builder: emit a model-issued computer call as OpenAI's
+/// `computer_call` output item so Codex's computer-use plugin recognizes it
+/// and executes the action. `action_json` is the raw arguments object —
+/// embedded verbatim (callers have already verified it is an object).
+pub fn appendComputerCallItem(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    item_id: []const u8,
+    call_id: []const u8,
+    action_json: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_call = try jsonEscape(allocator, call_id);
+    defer allocator.free(esc_call);
+    try buf.appendSlice(allocator, "{\"type\":\"computer_call\",\"id\":");
+    try buf.appendSlice(allocator, esc_id);
+    try buf.appendSlice(allocator, ",\"call_id\":");
+    try buf.appendSlice(allocator, esc_call);
+    try buf.appendSlice(allocator, ",\"status\":\"completed\",\"action\":");
+    try buf.appendSlice(allocator, action_json);
+    try buf.appendSlice(allocator, "}");
 }
 
 // ─── compaction (round-trippable opaque blob) ────────────────────────────

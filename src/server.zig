@@ -13286,9 +13286,24 @@ fn responsesToolExists(tools_val: ?std.json.Value, name: []const u8) bool {
         if (tool_val != .object) continue;
         const tool = tool_val.object;
         const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+        // The computer-use hosted tool is translated to a `computer` function
+        // tool in buildToolsJson — a model call to `computer` is declared here.
+        if (responses_mod.isComputerUseToolType(t) and std.mem.eql(u8, name, "computer")) return true;
         if (!std.mem.eql(u8, t, "function")) continue;
         const tool_name = if (tool.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
         if (std.mem.eql(u8, tool_name, name)) return true;
+    }
+    return false;
+}
+
+/// Does the request's `tools` array declare a hosted computer-use tool?
+fn inResponsesToolType(tools_val: ?std.json.Value) bool {
+    const v = tools_val orelse return false;
+    if (v != .array) return false;
+    for (v.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const t = if (tool_val.object.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+        if (responses_mod.isComputerUseToolType(t)) return true;
     }
     return false;
 }
@@ -14329,11 +14344,22 @@ fn handleResponses(
                 return err;
             };
             if (emitted > 0) try out_buf.append(allocator, ',');
-            try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
-            emitted += 1;
-            if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+            const computer_call = std.mem.eql(u8, tc.name, "computer") and
+                inResponsesToolType(root.get("tools"));
+            if (computer_call) {
+                // Emit as OpenAI's `computer_call` output item so the client's
+                // computer-use plugin recognizes and executes the action.
+                try responses_mod.appendComputerCallItem(allocator, &out_buf, fc_id, call_id, tc.arguments);
+                if (is_stream) {
+                    try emitResponsesComputerCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.arguments);
+                }
+            } else {
+                try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
+                if (is_stream) {
+                    try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+                }
             }
+            emitted += 1;
             output_index += 1;
         }
     };
@@ -15292,6 +15318,41 @@ fn emitResponsesFunctionCallEvents(
         const item_done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":{s},"status":"completed"}}}}
         , .{ output_index, esc_id, esc_call, esc_name, esc_args });
+        defer allocator.free(item_done);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
+    }
+}
+
+/// Streaming events for a model-issued computer call: item.added / item.done
+/// with `type:"computer_call"` and the action object inline. There are no
+/// argument deltas — the action is small and Codex only needs the final item.
+fn emitResponsesComputerCallEvents(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    output_index: u32,
+    fc_id: []const u8,
+    call_id: []const u8,
+    action_json: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, fc_id);
+    defer allocator.free(esc_id);
+    const esc_call = try jsonEscape(allocator, call_id);
+    defer allocator.free(esc_call);
+    const esc_action = try jsonEscape(allocator, action_json);
+    defer allocator.free(esc_action);
+
+    {
+        const item_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"computer_call","id":{s},"call_id":{s},"status":"in_progress","action":{{}}}}}}
+        , .{ output_index, esc_id, esc_call });
+        defer allocator.free(item_added);
+        try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
+    }
+    {
+        const item_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"computer_call","id":{s},"call_id":{s},"status":"completed","action":{s}}}}}
+        , .{ output_index, esc_id, esc_call, esc_action });
         defer allocator.free(item_done);
         try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
     }
