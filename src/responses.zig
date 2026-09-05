@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const chat_mod = @import("chat.zig");
+const log = @import("log.zig");
 
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
@@ -397,7 +398,10 @@ pub fn parseInput(
                 } else if (std.mem.eql(u8, t, "compaction")) {
                     appendCompactionInputItem(allocator, &pi, obj) catch {};
                 } else {
-                    // Unknown item type — skip silently.
+                    // Unknown item type (computer-use plugins send
+                    // `computer_call`/`computer_call_output`). Dropped — and the
+                    // warn names it, so the gap is visible instead of silent.
+                    log.warn("[responses] unknown input item type '{s}' dropped (not translated to a chat message)\n", .{t});
                     continue;
                 }
             }
@@ -436,6 +440,9 @@ fn normalizeRole(role: []const u8) []const u8 {
     {
         return role;
     }
+    // DIAGNOSTIC (Codex computer-use): fires exactly when a client rides a role
+    // outside the template's set — this warn is the evidence of what that role is.
+    log.warn("[responses] non-template role '{s}' folded to \"user\" (chat templates raise on unknown roles)\n", .{role});
     return "user";
 }
 
