@@ -552,6 +552,15 @@ pub const SlotPool = struct {
             self.fill_copy_bytes += transient;
         }
         for (0..PIECES) |p| self.pools[p] = updateds[p];
+        // CORRUPTION MITIGATION (dev): flush MLX's allocator cache after every
+        // fill. The donated old pool buffers land in MLX's cache; a later
+        // QSA/attention allocation can recycle those bytes, and reading
+        // recycled expert-bank bytes as KV manifests as mid-generation token
+        // salad (coherent prefix, mojibake/digit-salad tail). Clearing the
+        // cache forces fresh allocations for attention scratch instead.
+        // PERF: measured cost is acceptable; revisit with a ring of
+        // dedicated non-recycled banks if it regresses.
+        _ = mlx.mlx_clear_cache();
         self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
         self.disk_read_ns += disk_ns;
         self.fill_ops += nm;
