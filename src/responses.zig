@@ -418,9 +418,25 @@ pub fn parseInput(
 /// `appendMessageItem`, compaction-blob messages in
 /// `appendCompactionInputItem`, anything added later), so a new path cannot
 /// quietly reintroduce the raw role.
+///
+/// Role ALLOWLIST, not a mapping table: the Qwen-family chat template renders
+/// only system/user/assistant/tool and RAISES on anything else
+/// (`raise_exception('Unexpected message role.')` at chat_template.jinja:160),
+/// which used to drop the whole request into the generic-format fallback and
+/// degrade tool calling. `developer` folds to `system` (o-series/Codex).
+/// UNKNOWN roles — Codex's computer-use plugin rides a `computer` role — fold
+/// to `user`: they are environment observations, and `user` is the only
+/// template-accepted channel that keeps their text in the prompt.
 fn normalizeRole(role: []const u8) []const u8 {
     if (std.mem.eql(u8, role, "developer")) return "system";
-    return role;
+    if (std.mem.eql(u8, role, "system") or
+        std.mem.eql(u8, role, "user") or
+        std.mem.eql(u8, role, "assistant") or
+        std.mem.eql(u8, role, "tool"))
+    {
+        return role;
+    }
+    return "user";
 }
 
 fn appendMessageItem(
