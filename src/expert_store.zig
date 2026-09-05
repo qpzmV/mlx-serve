@@ -351,6 +351,13 @@ pub const SlotPool = struct {
     /// banks are doing a whole-block copy per fill.
     fill_copy_bytes: u64 = 0,
     sample_stats: bool = false,
+    /// Host-write mode (default): pool banks are StorageModeShared MTLBuffers
+    /// whose identity never changes; fills pread straight into them. The legacy
+    /// scatter+donation path (MLX_SERVE_EXPERT_SCATTER=1) corrupted the heap.
+    hostwrite: bool = true,
+    /// Cached host pointers of the pool banks — valid for the process lifetime
+    /// because the bank arrays are never replaced in hostwrite mode.
+    host_ptrs: [PIECES]?[*]u8 = @splat(null),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -368,6 +375,7 @@ pub const SlotPool = struct {
             .rd = undefined,
             .map = std.AutoHashMap(u64, u32).init(allocator),
             .sample_stats = envInt("MLX_SERVE_EXPERT_STATS") > 0,
+            .hostwrite = envInt("MLX_SERVE_EXPERT_SCATTER") == 0,
         };
         // Create the pread workers BEFORE registering errdefer self.deinit(): if
         // this fails, self.rd is still undefined and deinit would destroy it.
@@ -383,6 +391,7 @@ pub const SlotPool = struct {
             try mlx.check(mlx.mlx_zeros(&arr, &shape, shape.len, store.refs[p].dtype, s));
             self.pools[p] = arr; // exactly one handle from here on
         }
+        try self.refreshHostPtrs();
         self.key_of = try allocator.alloc(?u64, slots);
         errdefer allocator.free(self.key_of);
         @memset(self.key_of, null);
@@ -393,6 +402,19 @@ pub const SlotPool = struct {
         errdefer allocator.free(self.pin);
         @memset(self.pin, false);
         return self;
+    }
+
+    /// Materialize the pool banks and cache their host pointers (hostwrite mode).
+    /// The bank arrays are never replaced afterwards, so the pointers stay valid
+    /// for the process lifetime and every fill writes through them directly.
+    fn refreshHostPtrs(self: *SlotPool) !void {
+        if (!self.hostwrite) return;
+        for (0..PIECES) |p| {
+            try mlx.check(mlx.mlx_array_eval(self.pools[p])); // materialize the buffer
+            const ptr = mlx.mlx_array_data_uint8(self.pools[p]) orelse return error.PoolHostPointerMissing;
+            self.host_ptrs[p] = @constCast(ptr);
+        }
+        log.info("[expert] host-write fills enabled — banks pread in place, no scatter/eval", .{});
     }
 
     pub fn deinit(self: *SlotPool) void {
@@ -463,108 +485,135 @@ pub const SlotPool = struct {
             miss_experts[m] = experts[ei];
         }
 
-        // Slot-index array (u32 [nm]) as one MLX index tensor for all scatters.
-        // `chosen` already holds the victim slots in miss order — reuse it.
-        const sidx_shape = [_]c_int{@intCast(nm)};
-        const slot_idx_arr = mlx.mlx_array_new_data(chosen.ptr, &sidx_shape, 1, .uint32);
-        defer _ = mlx.mlx_array_free(slot_idx_arr);
-        const idx_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{slot_idx_arr}, 1);
-        defer _ = mlx.mlx_vector_array_free(idx_vec);
-
         const fill_io = std.Io.Threaded.global_single_threaded.io();
         const fill_t0 = std.Io.Timestamp.now(fill_io, .awake);
 
-        // PHASE 1 — parallel disk read. Allocate one staging per piece, then fan
-        // all PIECES*nm preads across the ReadPool workers (serial pread was ~71%
-        // of fill time). Staging rows are row-major by miss order so the scatter
-        // below relabels them without a data move.
-        var stagings: [PIECES][]u8 = undefined;
-        var n_staged: usize = 0;
-        while (n_staged < PIECES) : (n_staged += 1) {
-            stagings[n_staged] = a.alloc(u8, nm * self.store.piece_row_bytes[n_staged]) catch |err| {
-                for (stagings[0..n_staged]) |sbuf| a.free(sbuf);
-                return err;
-            };
-        }
-        defer for (&stagings) |*sp| a.free(sp.*);
-
-        var tasks = try a.alloc(ReadTask, PIECES * nm);
-        defer a.free(tasks);
-        var ti: usize = 0;
-        for (0..PIECES) |p| {
-            const r = self.store.refs[layer * PIECES + p];
-            const rb = r.row_bytes;
-            const fd = self.store.shards[r.shard].fd;
-            for (0..nm) |i| {
-                tasks[ti] = .{
-                    .fd = fd,
-                    .off = r.byte_offset + @as(u64, miss_experts[i]) * rb,
-                    .dst = stagings[p].ptr + i * rb,
-                    .len = rb,
-                };
-                ti += 1;
+        if (self.hostwrite) {
+            // ── HOST-WRITE PATH (default) ──
+            // The pool banks are StorageModeShared MTLBuffers whose identity
+            // NEVER changes: misses are pread STRAIGHT INTO the bank at the
+            // victim slot's row offset by the ReadPool workers. No scatter, no
+            // eval, no buffer donation. The old scatter+donation path freed our
+            // pool handle before eval so MLX would donate the buffer to the
+            // scatter output; that in-place patch of a shared, hazard-untracked
+            // buffer corrupted the heap (malloc aborts) and silently produced
+            // wrong expert rows → coherent-prefix token salad. Host writes race
+            // nothing: every earlier layer's gathers are complete before this
+            // layer's remap runs (the router ids astype→eval chain forces them),
+            // and later gathers are enqueued only after these writes.
+            var tasks = try a.alloc(ReadTask, PIECES * nm);
+            defer a.free(tasks);
+            var ti: usize = 0;
+            for (0..PIECES) |p| {
+                const r = self.store.refs[layer * PIECES + p];
+                const rb = r.row_bytes;
+                const fd = self.store.shards[r.shard].fd;
+                const base = self.host_ptrs[p] orelse return error.PoolHostPointerMissing;
+                for (0..nm) |i| {
+                    tasks[ti] = .{
+                        .fd = fd,
+                        .off = r.byte_offset + @as(u64, miss_experts[i]) * rb,
+                        .dst = base + @as(usize, chosen[i]) * @as(usize, @intCast(rb)),
+                        .len = @intCast(rb),
+                    };
+                    ti += 1;
+                }
             }
-        }
-        const rd_t0 = std.Io.Timestamp.now(fill_io, .awake);
-        if (!self.rd.run(tasks)) return error.IoReadFailed;
-        const disk_ns: u64 = @intCast(rd_t0.untilNow(fill_io, .awake).nanoseconds);
+            const rd_t0 = std.Io.Timestamp.now(fill_io, .awake);
+            if (!self.rd.run(tasks)) return error.IoReadFailed;
+            const disk_ns: u64 = @intCast(rd_t0.untilNow(fill_io, .awake).nanoseconds);
+            self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
+            self.disk_read_ns += disk_ns;
+            self.fill_ops += nm;
+            self.io_bytes += nm * self.store.record_bytes;
+        } else {
+            // ── SCATTER PATH (legacy; MLX_SERVE_EXPERT_SCATTER=1) ──
+            // Kept for A/B only. See the host-write path above for why this is
+            // no longer the default.
 
-        // PHASE 2 — build all 9 scatters, then ONE batched eval. Each bank used to
-        // force its own eval() (9 GPU↔CPU sync barriers per fill, ×48 layers on the
-        // decode critical path). Batching to one mlx_eval over the 9 outputs cuts
-        // 8 barriers/fill. Donation still fires per bank: freeing OUR pool handle
-        // right after its scatter leaves that Scatter op's graph as the sole owner
-        // of the pool buffer, so is_donatable() is true at eval → out shares it
-        // (no whole-block copy). `updates` (host→MLX wrappers) and `stagings` must
-        // outlive the batched eval; updates freed after it, stagings at fn end.
-        var probe_base: usize = 0;
-        if (self.sample_stats) {
-            for (0..PIECES) |pp| _ = mlx.mlx_array_eval(self.pools[pp]); // commit all banks
-            _ = mlx.mlx_get_active_memory(&probe_base);
-            _ = mlx.mlx_reset_peak_memory();
-        }
+            // Slot-index array (u32 [nm]) as one MLX index tensor for all scatters.
+            // `chosen` already holds the victim slots in miss order — reuse it.
+            const sidx_shape = [_]c_int{@intCast(nm)};
+            const slot_idx_arr = mlx.mlx_array_new_data(chosen.ptr, &sidx_shape, 1, .uint32);
+            defer _ = mlx.mlx_array_free(slot_idx_arr);
+            const idx_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{slot_idx_arr}, 1);
+            defer _ = mlx.mlx_vector_array_free(idx_vec);
 
-        var updateds: [PIECES]mlx.mlx_array = undefined;
-        var updates_arr: [PIECES]mlx.mlx_array = undefined;
-        const axes = [_]c_int{0};
-        for (0..PIECES) |p| {
-            const r = self.store.refs[layer * PIECES + p];
-            const upd_shape = [_]c_int{ @intCast(nm), 1, @intCast(r.d1), @intCast(r.d2) };
-            const updates = mlx.mlx_array_new_data(stagings[p].ptr, &upd_shape, upd_shape.len, r.dtype);
-            updates_arr[p] = updates;
-            var updated = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_scatter(&updated, self.pools[p], idx_vec, updates, &axes, 1, self.s));
-            _ = mlx.mlx_array_free(self.pools[p]); // graph is now sole owner → eval donates
-            updateds[p] = updated;
-        }
-        const out_vec = mlx.mlx_vector_array_new_data(&updateds, PIECES);
-        defer _ = mlx.mlx_vector_array_free(out_vec);
-        const ev_t0 = std.Io.Timestamp.now(fill_io, .awake);
-        try mlx.check(mlx.mlx_eval(out_vec)); // ONE barrier for all 9 banks
-        self.eval_ns += @intCast(ev_t0.untilNow(fill_io, .awake).nanoseconds);
-        for (&updates_arr) |u| _ = mlx.mlx_array_free(u);
+            // PHASE 1 — parallel disk read. Allocate one staging per piece, then fan
+            // all PIECES*nm preads across the ReadPool workers (serial pread was ~71%
+            // of fill time). Staging rows are row-major by miss order so the scatter
+            // below relabels them without a data move.
+            var stagings: [PIECES][]u8 = undefined;
+            var n_staged: usize = 0;
+            while (n_staged < PIECES) : (n_staged += 1) {
+                stagings[n_staged] = a.alloc(u8, nm * self.store.piece_row_bytes[n_staged]) catch |err| {
+                    for (stagings[0..n_staged]) |sbuf| a.free(sbuf);
+                    return err;
+                };
+            }
+            defer for (&stagings) |*sp| a.free(sp.*);
 
-        if (self.sample_stats) {
-            var probe_peak: usize = 0;
-            _ = mlx.mlx_get_peak_memory(&probe_peak);
-            const transient = probe_peak -| probe_base; // extra bytes alive at peak
-            self.last_fill_peak_bytes = @max(self.last_fill_peak_bytes, transient);
-            self.fill_copy_bytes += transient;
+            var tasks = try a.alloc(ReadTask, PIECES * nm);
+            defer a.free(tasks);
+            var ti: usize = 0;
+            for (0..PIECES) |p| {
+                const r = self.store.refs[layer * PIECES + p];
+                const rb = r.row_bytes;
+                const fd = self.store.shards[r.shard].fd;
+                for (0..nm) |i| {
+                    tasks[ti] = .{
+                        .fd = fd,
+                        .off = r.byte_offset + @as(u64, miss_experts[i]) * rb,
+                        .dst = stagings[p].ptr + i * rb,
+                        .len = rb,
+                    };
+                    ti += 1;
+                }
+            }
+            const rd_t0 = std.Io.Timestamp.now(fill_io, .awake);
+            if (!self.rd.run(tasks)) return error.IoReadFailed;
+            const disk_ns: u64 = @intCast(rd_t0.untilNow(fill_io, .awake).nanoseconds);
+
+            // PHASE 2 — build all 9 scatters, then ONE batched eval. Each bank used to
+            // force its own eval() (9 GPU↔CPU sync barriers per fill, ×48 layers on the
+            // decode critical path). Batching to one mlx_eval over the 9 outputs cuts
+            // 8 barriers/fill. Donation still fires per bank: freeing OUR pool handle
+            // right after its scatter leaves that Scatter op's graph as the sole owner
+            // of the pool buffer, so is_donatable() is true at eval → out shares it
+            // (no whole-block copy). `updates` (host→MLX wrappers) and `stagings` must
+            // outlive the batched eval; updates freed after it, stagings at fn end.
+            var updateds: [PIECES]mlx.mlx_array = undefined;
+            var updates_arr: [PIECES]mlx.mlx_array = undefined;
+            const axes = [_]c_int{0};
+            for (0..PIECES) |p| {
+                const r = self.store.refs[layer * PIECES + p];
+                const upd_shape = [_]c_int{ @intCast(nm), 1, @intCast(r.d1), @intCast(r.d2) };
+                const updates = mlx.mlx_array_new_data(stagings[p].ptr, &upd_shape, upd_shape.len, r.dtype);
+                updates_arr[p] = updates;
+                var updated = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_scatter(&updated, self.pools[p], idx_vec, updates, &axes, 1, self.s));
+                _ = mlx.mlx_array_free(self.pools[p]); // graph is now sole owner → eval donates
+                updateds[p] = updated;
+            }
+            const out_vec = mlx.mlx_vector_array_new_data(&updateds, PIECES);
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+            const ev_t0 = std.Io.Timestamp.now(fill_io, .awake);
+            try mlx.check(mlx.mlx_eval(out_vec)); // ONE barrier for all 9 banks
+            self.eval_ns += @intCast(ev_t0.untilNow(fill_io, .awake).nanoseconds);
+            for (&updates_arr) |u| _ = mlx.mlx_array_free(u);
+            for (0..PIECES) |p| self.pools[p] = updateds[p];
+            // CORRUPTION MITIGATION (dev): flush MLX's allocator cache after every
+            // fill. The donated old pool buffers land in MLX's cache; a later
+            // QSA/attention allocation can recycle those bytes, and reading
+            // recycled expert-bank bytes as KV manifests as mid-generation token
+            // salad (coherent prefix, mojibake/digit-salad tail). Clearing the
+            // cache forces fresh allocations for attention scratch instead.
+            _ = mlx.mlx_clear_cache();
+            self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
+            self.disk_read_ns += disk_ns;
+            self.fill_ops += nm;
+            self.io_bytes += nm * self.store.record_bytes;
         }
-        for (0..PIECES) |p| self.pools[p] = updateds[p];
-        // CORRUPTION MITIGATION (dev): flush MLX's allocator cache after every
-        // fill. The donated old pool buffers land in MLX's cache; a later
-        // QSA/attention allocation can recycle those bytes, and reading
-        // recycled expert-bank bytes as KV manifests as mid-generation token
-        // salad (coherent prefix, mojibake/digit-salad tail). Clearing the
-        // cache forces fresh allocations for attention scratch instead.
-        // PERF: measured cost is acceptable; revisit with a ring of
-        // dedicated non-recycled banks if it regresses.
-        _ = mlx.mlx_clear_cache();
-        self.fill_ns += @intCast(fill_t0.untilNow(fill_io, .awake).nanoseconds);
-        self.disk_read_ns += disk_ns;
-        self.fill_ops += nm;
-        self.io_bytes += nm * self.store.record_bytes;
 
         for (miss_pos.items, chosen[0..nm]) |ei, sl| {
             const k = (ExpertKey{ .layer = layer, .expert = experts[ei] }).bits();
@@ -605,6 +654,7 @@ pub const SlotPool = struct {
             try mlx.check(mlx.mlx_zeros(&arr, &shape, shape.len, self.store.refs[p].dtype, self.s));
             self.pools[p] = arr;
         }
+        try self.refreshHostPtrs();
         self.key_of = try a.alloc(?u64, new_slots);
         @memset(self.key_of, null);
         self.ref = try a.alloc(bool, new_slots);

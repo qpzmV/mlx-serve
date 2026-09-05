@@ -19834,6 +19834,16 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
         }
 
+        // EXPERIMENT (corruption hunt): MLX_SERVE_EXPERT_SYNC=1 forces a
+        // per-layer eval of the MoE output so no gather referencing the pool
+        // banks is still queued when a later fill patches the shared donated
+        // buffer in place. Zero-cost when unset.
+        if (streaming_pool_active) {
+            if (std.c.getenv("MLX_SERVE_EXPERT_SYNC")) |_| {
+                try mlx.check(mlx.mlx_array_eval(expert_sum));
+            }
+        }
+
         // Hy3: shared expert ALWAYS added, no gate (reference MoE.__call__:
         // `y = y + self.shared_mlp(x)`). shared_gate_w carries a real handle
         // only when the checkpoint shipped mlp.shared_mlp.* weights.

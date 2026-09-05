@@ -120,3 +120,31 @@ MLX_SERVE_QSA_DECODE_GATHER=0 MLX_SERVE_QSA_GATHER=0 MLX_SERVE_QSA_FUSED=0 MLX_S
 1. 投机解码 × 流式池的根因修复（spec 轮内冻结池 / 验证重读一致权重）——架构级工程；
 2. `computer_call_output` 观察翻译进 prompt（computer-use 插件真正可用需此步）；
 3. 二分定位三个 QSA env 中具体哪个与流式交互损坏（45k 场景，~15 分钟/步）。
+
+## 2026-09-06 根因修复：流式池乱码/空响应 = scatter 捐赠路径的堆破坏（host-write 直写替换）
+
+### 症状与定位（全部实测，develop 二进制）
+- 常驻（无 --expert-stream）：中文多轮工具调用 4/4 全对 → 回归与 main31/decode 内核无关；
+- 流式冷启动 + 短 prompt（~350tok）：word salad / 空响应 / 乱码工具名（`白皙!`、`run`）8/10 坏；
+- 同二进制长 prompt（~30k）或池预热后：0/10 坏 → 之前"feat 流式稳定"的对比前提不成立，feat 流式同坏（3/4）；
+- 矩阵实验排除 QSA（全程未启用）、PLD/MTP（关掉仍坏）、fill 数量（长请求 24k fills 干净 vs 冷短 232 fills 坏）、缩池/watchdog（日志无事件）。
+
+### 根因（崩溃报告实锤）
+`mlx_array_free` ← `SlotPool.ensure` 抛 `BUG_IN_CLIENT_OF_LIBMALLOC: POINTER_BEING_FREED_WAS_NOT_ALLOCATED`。
+捐赠路径 `mlx_scatter` 后立即 free 我方池句柄 → MLX Scatter::eval_gpu 经 `set_copy_output_data` 把输出
+`copy_shared_buffer` 到旧池 buffer（in-place patch，`HazardTrackingModeUntracked`）→ 句柄/对象生命周期
+与池 buffer 别名交织 → 堆破坏：多数时候表现为"读错专家行"（连贯前缀+乱码尾），偶尔直接 malloc abort。
+对照实验：禁捐赠强制拷贝路径（句柄 eval 后再 free）冷+短 6/6 干净（0.3 tok/s，不可用）；
+每层强制 eval(down_out) 不解决（证明非"在途读者竞态"而是内存不安全）。
+
+### 修复：host-write 直写（提交见 git log）
+池 bank（`StorageModeShared`）**身份永不变**：init 时 eval 一次物化并缓存主机指针（`mlx_array_data_uint8`+
+`@constCast`）；ensure() 的 miss 直接由 ReadPool **pread 进池 buffer** 的 victim 槽行偏移。无 scatter、
+无 eval、无捐赠、无 `mlx_clear_cache` 缓解（一并移除）。CPU 写→GPU 读的顺序由既有 router-ids
+`astype→eval` 链保证（前层 gather 全部完成）。`MLX_SERVE_EXPERT_SCATTER=1` 可回退旧路径（仅 A/B 用）。
+
+### 实测（冷启动、短 prompt、中文多轮、PLD+QSA 默认）
+- 修复前：8/10~6/6 乱码或空响应；
+- 修复后：10/10 干净、多轮 4/4 工具链全对（`ls -la`→`read_file`→`cat`→`pwd && ls -laR`）；
+- **decode 28.9 tok/s**（原捐赠 17-19，拷贝 0.3）——fill 无 GPU round-trip，反而更快；
+- 长 prompt（29k）prefill 333 tok/s、decode 17.5 tok/s、内容连贯。
