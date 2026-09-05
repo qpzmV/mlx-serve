@@ -169,3 +169,19 @@ scheduler 把 in-checkpoint 头挂成 `MtpHeadRef{.qwen4}`、模块回滚谓词�
   工具调用类输出 72-81 tok/s（接受率 91.7%，avg 2.75 tok/轮，+150%+）
 - 正确性回归：冷启动短 prompt 工具调用 4/4+6/6 干净、29k 长上下文工具调用正常、无乱码/空响应
 - 自适应宽度选择器按 ctx 桶收敛（w1-w3 13.7-35.8 ms/tok），spec-cost 表跨重启持久
+
+## 2026-09-06 pi"回答截断"判定：非 MTP 回归，是 temp=1.0 采样下模型中途吐 <|im_end|>
+
+### 现象与判定链
+用户 pi 会话（temp=1.00, top_k=20, thinking）回答在代码中途结束，fin=stop。复现与归因：
+- 新增 `[spec-eos]` 诊断日志（publishSpeculativeBlock 在 EOS finish 时打印 token id/位置）；
+- 复现捕获：finisher 全部是 eos_id=248046（`<|im_end|>`），合法轮末与中途截断同源；
+- **串行对照（--no-mtp --no-pld）temp=1.0 ×10：同样 2/10 中途截断** → MTP 无罪
+  （Leviathan min(1,p/q) 保持目标分布，截断率与串行统计一致）；
+- **temp=0.6 ×10：0/10 截断** → 温度是唯一杠杆（im_end 的 mid-code 概率质量随温度锐减）。
+
+### 结论与建议
+1. MTP 默认开启维持不变——无正确性回归；
+2. 编码代理流量（pi/Codex）建议温度 0.6：截断、内容质量（FFT 误解、代码 bug）同源于
+   temp=1.0 的过热采样，pi 配置层调温即可；
+3. `[spec-eos]` INFO 日志保留：后续任何"提前停止"投诉可直接看 finisher token id。

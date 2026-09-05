@@ -5876,6 +5876,9 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     for (tokens) |t| {
         if (slot.cancelled.load(.acquire)) return;
         if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            log.info("[spec-eos] finished on eos_id={d} at completion_token={d} (block_len={d})\n", .{
+                t, slot.completion_tokens, tokens.len,
+            });
             finishSlot(sch, slot, "stop");
             return;
         }
