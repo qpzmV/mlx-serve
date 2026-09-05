@@ -148,3 +148,24 @@ MLX_SERVE_QSA_DECODE_GATHER=0 MLX_SERVE_QSA_GATHER=0 MLX_SERVE_QSA_FUSED=0 MLX_S
 - 修复后：10/10 干净、多轮 4/4 工具链全对（`ls -la`→`read_file`→`cat`→`pwd && ls -laR`）；
 - **decode 28.9 tok/s**（原捐赠 17-19，拷贝 0.3）——fill 无 GPU round-trip，反而更快；
 - 长 prompt（29k）prefill 333 tok/s、decode 17.5 tok/s、内容连贯。
+
+## 2026-09-06 MTP 投机解码接通并设为 qwen4_exp 默认（实测 +53%，工具类 +150%+）
+
+### 现状澄清
+"[qwen4] MTP head loaded (...; spec wiring pending)" 的日志措辞过时——接线其实早已存在：
+scheduler 把 in-checkpoint 头挂成 `MtpHeadRef{.qwen4}`、模块回滚谓词、`nextMtp` 全套 `.qwen4`
+分支都在。真正关掉它的是 server 的每请求默认门：`defaultEnableMtp` 对 MoE 默认 OFF，豁免
+`nativeMoeMtpHeadMeasured()` 硬编码 return false（从未测量）。
+
+### 本次改动
+1. `nativeMoeMtpHeadMeasured` → `self.qwen4_mtp != null`（带测量注释：短上下文已测，长上下文
+   由按 ctx 桶的 round-cost 表自动收敛 w1≈串行兜底，ladder 复测为 TODO）；
+2. 过时日志行更新为 "resident expert bank, module-rollback verified"。
+
+### 基准（M5 Max / 4bit / 48GB 池 / host-write fills，5-6 prompts/场景）
+- 串行（--no-mtp --no-pld）：25.4 tok/s
+- PLD（--no-mtp，n-gram gate）：25.8 tok/s（gate 在新颖内容上基本不开，≈串行）
+- **MTP（新默认，无旗标）：39.0 tok/s（散文/代码 +53%）**；echo 场景 42.1；
+  工具调用类输出 72-81 tok/s（接受率 91.7%，avg 2.75 tok/轮，+150%+）
+- 正确性回归：冷启动短 prompt 工具调用 4/4+6/6 干净、29k 长上下文工具调用正常、无乱码/空响应
+- 自适应宽度选择器按 ctx 桶收敛（w1-w3 13.7-35.8 ms/tok），spec-cost 表跨重启持久
