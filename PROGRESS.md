@@ -306,3 +306,12 @@ sorted 流优化利用了权重局部性，但相对"按 expert 分段的 M=91 �
 真正的 segmented GEMM 需要 tile 化 micro-kernel（W/x 分块驻留 + uint4 向量化 +
 双缓冲），是独立 kernel 工程项目。代码保留（MLX_SERVE_SEG_QMM=1 实验开关），
 默认路径恢复 mlx_gather_qmm。prefill 提速的正路 = MLX 上游改造或专业 GEMM 工程。
+
+### Batched NAX 原型追加实验（NEGATIVE，已回退）
+确认了 NAX gather kernel 的 W 选择是 per-batch（tid.z）——x [N,1,D] 分解为
+B=N、M=1，409600 个退化 threadgroup、NAX tile 利用率 1/64，是 prefill 慢的
+精确机制。graph 层修复原型（x 重排 [n_b,64,D] 每 batch 64 行同 expert + pad）
+反复段错误/double-free：跨层 MLX 句柄状态与 Zig defer 生命周期交错，堆破坏
+难定位。结论：该优化必须下沉为 MLX gather_qmm kernel 内部的 segmented
+dispatch（per-batch expert 已在 kernel 语义内，加段对齐 tile 即可），graph
+层 hack 不可维护。已回退至 6405458 干净状态。
