@@ -315,3 +315,12 @@ B=N、M=1，409600 个退化 threadgroup、NAX tile 利用率 1/64，是 prefill
 难定位。结论：该优化必须下沉为 MLX gather_qmm kernel 内部的 segmented
 dispatch（per-batch expert 已在 kernel 语义内，加段对齐 tile 即可），graph
 层 hack 不可维护。已回退至 6405458 干净状态。
+
+### Batched NAX 原型 v2 追加（段对齐 pad + 图层重排，崩溃未解，回退）
+确认 NAX kernel W 选择 per-batch（adjust_matrix_offsets: w_idx = rhs_indices[tid.z]，
+w += w_idx * w_strides[0]）——x [N,1,D] 分解 B=N、M=1：409600 个 threadgroup、
+NAX 64 行 tile 只喂 1 行（利用率 1/64）= prefill 慢的精确机制。
+graph 层修复原型（take_axis 段对齐重排 [n_b,64,D] + rhs [n_b] + inv 裁剪）实现后
+反复 mlx_array_free 段错误（堆损坏，getShape/free 处引爆；崩溃报告无行号精度）。
+WIP diff 存 batched_nax_wip.diff。下一步=LLDB 逐数组二分定位堆破坏点，或直接在
+MLX 源码层（quantized_nax.h 的 tile 分配加段对齐）做正式实现。
