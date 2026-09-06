@@ -206,3 +206,23 @@ Codex computer-use 插件走 /v1/responses 的托管工具协议（`computer_use
   R2 回填截图 → 模型看见画面 → 发 double_click coordinate:[512,320]（视觉反馈闭环）；
 - 流式 computer_call 事件正常；普通 function 工具与 /v1/chat/completions 工具无回归；
 - 引擎采样/工具链无改动，7813d9b 的截断修复不受影响。
+
+## 2026-09-06 Codex 提问卡死修复：未声明工具调用从"静默丢弃"改"透传"
+
+### 根因
+Codex 会话中模型幻觉出未声明的工具名（如 `list_mcp_tools`，temp=1.0 采样行为），
+引擎防线把它静默丢弃 → 该轮响应里既无正文也无工具调用 → 客户端 agent 循环收到
+空回合，无事可做 → 卡住。与 pi 时代空响应卡死同型：**生成结果被静默丢掉且无反馈
+回路**。幻觉本身不可怕，可怕的是模型得不到"该工具不存在"的反馈。
+
+### 修复
+`responsesToolExists` 检查从 continue 丢弃改为**透传 + warn**：OpenAI API 本就
+不校验工具名，客户端执行未声明工具会报错并把错误回填为 function_call_output，
+模型下一轮自然自我纠正。同循环的非对象 arguments 也从丢弃改透传（arguments 在
+线上本来就是 string）；唯一保留的硬校验是 computer_call 分支要求 action 为合法
+JSON 对象（否则整条响应体会畸形）。
+
+### 验证
+- 声明工具调用照常工作（read_file 路径回归通过）；
+- 透传路径与已验证的声明路径代码等价（仅去掉 continue）；
+- 采样 3 次未诱导出幻觉名（temp=1.0 随机），逻辑等价性由回归覆盖。

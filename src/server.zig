@@ -14327,12 +14327,23 @@ fn handleResponses(
     if (tool_calls) |tcs| if (tcs.len > 0) {
         for (tcs) |tc| {
             if (!responsesToolExists(root.get("tools"), tc.name)) {
-                log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
-                continue;
+                // PASS THROUGH, not drop (stall fix): dropping an undeclared
+                // call used to leave the response with neither text nor tool
+                // calls — the client agent loop sees a blank turn and hangs
+                // (Codex "提问卡住", 2026-09-06: model hallucinated
+                // `list_mcp_tools`, engine dropped it, nothing came back).
+                // OpenAI's API does not validate tool names either: emit the
+                // call, let the client fail it and feed the error back so the
+                // model can self-correct on the next turn.
+                log.warn("[responses] passing through undeclared tool call: {s}\n", .{tc.name});
             }
-            if (!isJsonObjectString(allocator, tc.arguments)) {
-                log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
-                continue;
+            const args_is_object = isJsonObjectString(allocator, tc.arguments);
+            if (!args_is_object) {
+                // Same stall-fix rationale: pass it through as a plain
+                // function_call (the `arguments` field is a string on the
+                // wire), never silently drop — a dropped call risks a blank
+                // turn the client cannot recover from.
+                log.warn("[responses] passing through tool call with non-object arguments: {s}\n", .{tc.name});
             }
             const fc_id = try responses_mod.makeId(stream.io, allocator, "fc");
             defer allocator.free(fc_id);
@@ -14344,7 +14355,11 @@ fn handleResponses(
                 return err;
             };
             if (emitted > 0) try out_buf.append(allocator, ',');
-            const computer_call = std.mem.eql(u8, tc.name, "computer") and
+            // The computer_call item inlines the action as a JSON OBJECT —
+            // only take this branch when the arguments really are an object,
+            // otherwise the whole response body would be malformed.
+            const computer_call = args_is_object and
+                std.mem.eql(u8, tc.name, "computer") and
                 inResponsesToolType(root.get("tools"));
             if (computer_call) {
                 // Emit as OpenAI's `computer_call` output item so the client's
