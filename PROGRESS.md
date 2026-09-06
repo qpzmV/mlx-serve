@@ -295,3 +295,14 @@ sorted 流优化利用了权重局部性，但相对"按 expert 分段的 M=91 �
 2. 短期接受 193 tok/s，配合 headroom(8cbf222) 防窗口吃满 + 会话卫生，
    压缩在 <100k 上下文点触发时 prefill 5-8 分钟内可完成（客户端可等待）；
 3. 换 lm_head/专家精度更高的包（oQ4）可同时缓解采样病与计算开销。
+
+### Segmented qmm 实验结果（NEGATIVE，默认关）
+为绕开 MLX gather_qmm 写了两版自研 fast kernel（mlxserve_moe_seg_qmm，host 段边界 +
+32 lane 切分）：
+- v1 lane 切 K + 每行 simd_sum：25k prefill 206.9 tok/s（基线 370）
+- v2 lane 切 M（无 barrier、私有 dot 链）：241.4 tok/s
+两版输出数学正确（KV 缓存解释精确连贯）但都慢于 MLX gather_qmm——其 kernel 在
+向量化加载与调度形态上优于朴素手写。教训：**"M=1 行级 qmv 形态差"≠"随手能写赢"**，
+真正的 segmented GEMM 需要 tile 化 micro-kernel（W/x 分块驻留 + uint4 向量化 +
+双缓冲），是独立 kernel 工程项目。代码保留（MLX_SERVE_SEG_QMM=1 实验开关），
+默认路径恢复 mlx_gather_qmm。prefill 提速的正路 = MLX 上游改造或专业 GEMM 工程。

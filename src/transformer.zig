@@ -19561,6 +19561,11 @@ pub const Transformer = struct {
         // here), so the gather_qmm fast path's "rhs_indices sorted" assumption
         // stays true. Remapping AFTER the argsort would silently corrupt it.
         var mwe: MoeMlpWeights = mw.*;
+        // Host-side segment boundaries built by the streaming remap above
+        // (non-null ⟺ segmented prefill qmm may engage in the sorted path).
+        var seg_offsets_host: ?[]u32 = null;
+        var seg_n_segments: usize = 0;
+        defer if (seg_offsets_host) |so| self.allocator.free(so);
         if (self.expert_pool) |pool| {
             if (mw.switch_gate_w.ctx == null) {
                 // Routed ids → host u32.
@@ -19597,6 +19602,39 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(ids_u32);
                 _ = mlx.mlx_array_free(inds);
                 inds = slot_inds;
+
+                // Host-side segment boundaries for the segmented prefill qmm
+                // (see segQmmSource). argsort(flat_inds) groups equal slot ids
+                // in ascending value order; counting the multiset over the
+                // uniq order reproduces those runs exactly, for free —
+                // `ids_u32` was already materialized on host for the remap.
+                if (segQmmEnabled() and ninds >= 2048) {
+                    const n_uniq = uniq.items.len;
+                    const counts = try self.allocator.alloc(u32, n_uniq);
+                    defer self.allocator.free(counts);
+                    @memset(counts, 0);
+                    for (ids_slice) |e| {
+                        if (seen.get(e)) |ui| counts[ui] += 1;
+                    }
+                    const orderu = try self.allocator.alloc(u32, n_uniq);
+                    defer self.allocator.free(orderu);
+                    for (orderu, 0..) |*o, i| o.* = @intCast(i);
+                    std.mem.sort(u32, orderu, uniq.items, struct {
+                        fn lt(u: []const u32, a: u32, b: u32) bool {
+                            return u[a] < u[b];
+                        }
+                    }.lt);
+                    const offs = try self.allocator.alloc(u32, n_uniq + 1);
+                    errdefer self.allocator.free(offs);
+                    offs[0] = 0;
+                    var racc: u32 = 0;
+                    for (orderu, 0..) |oi, k| {
+                        racc += counts[oi];
+                        offs[k + 1] = racc;
+                    }
+                    seg_offsets_host = offs;
+                    seg_n_segments = n_uniq;
+                }
 
                 // Substitute the pool banks. Plain STRUCT copies — they alias the
                 // pool arrays' single reference without adding a C-level owner, so
@@ -19700,9 +19738,23 @@ pub const Transformer = struct {
 
             // gate / up gather_qmm: x_rep [N,1,D], rhs_indices=sorted_inds [N],
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
+            // Segmented path: one kernel per piece, threadgroups tiled over the
+            // sorted expert runs so each weight row is fetched once per segment
+            // instead of once per output row (MLX_SERVE_SEG_QMM=0 disables).
+            const gate_n_out: u32 = @intCast(mlx.getShape(mwe.switch_gate_w)[1]);
+            const seg_gate = seg_offsets_host != null and
+                segQmmShapeOk(mwe.switch_gate_w, gate_qp.bits, gate_qp.group_size, gate_qp.mode, gate_n_out);
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try gatherExpertMm(&gate_out_3d, x_rep, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+            if (seg_gate) {
+                const offsets_arr = mlx.mlx_array_new_data(seg_offsets_host.?.ptr, &[_]c_int{@intCast(seg_n_segments + 1)}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(offsets_arr);
+                const g2 = try segmentedQmm(self.s, x_rep, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, sorted_inds, offsets_arr, @intCast(total_inds), gate_n_out, seg_n_segments, gate_qp.bits, gate_qp.group_size, mlx.mlx_array_dtype(x_rep));
+                defer _ = mlx.mlx_array_free(g2);
+                try mlx.check(mlx.mlx_expand_dims(&gate_out_3d, g2, -2, self.s)); // [N,1,inter]
+            } else {
+                try gatherExpertMm(&gate_out_3d, x_rep, mwe.switch_gate_w, mwe.switch_gate_s, mwe.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+            }
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
@@ -19710,7 +19762,15 @@ pub const Transformer = struct {
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try gatherExpertMm(&up_out_3d, x_rep, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+            if (seg_gate) {
+                const offsets_arr = mlx.mlx_array_new_data(seg_offsets_host.?.ptr, &[_]c_int{@intCast(seg_n_segments + 1)}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(offsets_arr);
+                const useg = try segmentedQmm(self.s, x_rep, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, sorted_inds, offsets_arr, @intCast(total_inds), gate_n_out, seg_n_segments, up_qp.bits, up_qp.group_size, mlx.mlx_array_dtype(x_rep));
+                defer _ = mlx.mlx_array_free(useg);
+                try mlx.check(mlx.mlx_expand_dims(&up_out_3d, useg, -2, self.s)); // [N,1,inter]
+            } else {
+                try gatherExpertMm(&up_out_3d, x_rep, mwe.switch_up_w, mwe.switch_up_s, mwe.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+            }
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -19729,7 +19789,18 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try gatherExpertMm(&down_3d, act_exp, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+            const down_n_out: u32 = @intCast(mlx.getShape(mwe.switch_down_w)[1]);
+            const seg_down = seg_offsets_host != null and
+                segQmmShapeOk(mwe.switch_down_w, down_qp.bits, down_qp.group_size, down_qp.mode, down_n_out);
+            if (seg_down) {
+                const offsets_arr = mlx.mlx_array_new_data(seg_offsets_host.?.ptr, &[_]c_int{@intCast(seg_n_segments + 1)}, 1, .uint32);
+                defer _ = mlx.mlx_array_free(offsets_arr);
+                const d2 = try segmentedQmm(self.s, act_exp, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, sorted_inds, offsets_arr, @intCast(total_inds), down_n_out, seg_n_segments, down_qp.bits, down_qp.group_size, mlx.mlx_array_dtype(act_exp));
+                defer _ = mlx.mlx_array_free(d2);
+                try mlx.check(mlx.mlx_expand_dims(&down_3d, d2, -2, self.s)); // [N,1,hidden]
+            } else {
+                try gatherExpertMm(&down_3d, act_exp, mwe.switch_down_w, mwe.switch_down_s, mwe.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
+            }
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -25674,7 +25745,192 @@ const GQMV_NVFP4_HEADER =
     \\}
 ;
 
-// ── Fused routed gate+up+SwiGLU (one kernel for what was three) ──
+// ── Segmented prefill qmm (MLX_SERVE_SEG_QMM, default on) ────────────────
+//
+// The prefill sorted path feeds `mlx_gather_qmm` N = S*K rows where the
+// rhs_indices are SORTED — consecutive runs of the same expert (avg run
+// ~91 rows at 4096-token chunks). MLX's kernel then processes each row as
+// an M=1 qmv, re-reading the expert's weight row per output row and
+// relying on SLC locality. This kernel exploits the sorted runs directly:
+// one threadgroup per (segment, output-row n), 32 lanes over the K
+// dimension, looping the segment's M rows through registers — the expert's
+// weight row is read ONCE per (segment, n) and reused for all M rows.
+// Measured motivation: MoE is 80.5% of 25k-token prefill (see PROGRESS.md),
+// of which ~89% is this gather_qmm compute.
+//
+// Segment boundaries are computed on the HOST from the already-evaluated
+// routing ids (free — `ids_u32` is materialized for the remap anyway) and
+// passed as the `offsets` input, so the kernel needs no boundary scan.
+
+const SEG_QMM_NAMES = [2][*:0]const u8{ "mlxserve_moe_seg_qmm", "mlxserve_moe_seg_qmm_b" };
+
+fn segQmmSource(comptime has_bias: bool) [:0]const u8 {
+    return std.fmt.comptimePrint(
+        \\uint lane = thread_position_in_grid.x;   // K-slice within 32 lanes
+        \\uint n = thread_position_in_grid.y;      // output row within the expert
+        \\uint seg = thread_position_in_grid.z;    // sorted expert segment
+        \\
+        \\uint start = offsets[seg];
+        \\uint end = offsets[seg + 1];
+        \\uint e = inds[start];                    // every row in the segment shares it
+        \\int K = int(K_size);
+        \\int N = int(N_size);
+        \\int VPW = 32 / BITS;                     // quantized values per uint32 word
+        \\int K_by_p = K / VPW;                    // packed words per row
+        \\int K_by_gs = K / GS;                    // quant groups per row
+        \\uint mask = (1u << BITS) - 1u;
+        \\size_t wbase = (size_t)e * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
+        \\size_t gbase = (size_t)e * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+        \\
+        \\for (uint m = start + lane; m < end; m += 32) {{
+        \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        \\  size_t xoff = (size_t)m * (size_t)K;
+        \\  for (int pack = 0; pack < K_by_p; ++pack) {{
+        \\    uint32_t packed = w_q[wbase + (size_t)pack];
+        \\    int k_base = pack * VPW;
+        \\    int gi = k_base / GS;                  // GS >= VPW: one group per word
+        \\{s}
+        \\  }}
+        \\  y[(size_t)m * (size_t)N + (size_t)n] = T((a0 + a1) + (a2 + a3));
+        \\}}
+    , .{ if (has_bias) GQMV_BODY_AFFINE else GQMV_BODY_AFFINE_NOBIAS });
+}
+
+const GQMV_BODY_AFFINE_NOBIAS =
+    \\  float sj = float(scales[gbase + (size_t)gi]);
+    \\  for (int ki = 0; ki < VPW; ki += 4) {
+    \\    size_t xi = xoff + (size_t)(k_base + ki);
+    \\    uint32_t q = packed >> (ki * BITS);
+    \\    a0 += float(x[xi + 0]) * (float((q >> (0 * BITS)) & mask) * sj);
+    \\    a1 += float(x[xi + 1]) * (float((q >> (1 * BITS)) & mask) * sj);
+    \\    a2 += float(x[xi + 2]) * (float((q >> (2 * BITS)) & mask) * sj);
+    \\    a3 += float(x[xi + 3]) * (float((q >> (3 * BITS)) & mask) * sj);
+    \\  }
+;
+
+const SEG_QMM_SOURCES = [2][:0]const u8{ segQmmSource(false), segQmmSource(true) };
+var seg_qmm_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null }; // [has_bias]
+var seg_qmm_engaged = false;
+
+fn segQmmEnabled() bool {
+    // EXPERIMENTAL, default OFF: two hand-rolled variants (lane-slices-K with
+    // per-row simd_sum; lane-slices-M with private dot chains) both measured
+    // SLOWER than mlx_gather_qmm on 25k-token prefill (207/241 vs 370 tok/s —
+    // MLX's kernel wins on vectorized loads and launch shape). The code stays
+    // as a base for a real tiled-GEMM attempt; MLX_SERVE_SEG_QMM=1 opts in.
+    const cached = struct {
+        var v: ?bool = null;
+    };
+    if (cached.v) |v| return v;
+    const env_v = std.c.getenv("MLX_SERVE_SEG_QMM");
+    const off = env_v != null and std.mem.eql(u8, std.mem.span(env_v.?), "0");
+    cached.v = !off;
+    return cached.v.?;
+}
+
+fn getSegQmmKernel(has_bias: bool) !mlx.mlx_fast_metal_kernel {
+    const bi: usize = @intFromBool(has_bias);
+    if (seg_qmm_kernels[bi]) |k| return k;
+    var input_names = std.ArrayList([*:0]const u8).empty;
+    defer input_names.deinit(std.heap.c_allocator);
+    input_names.appendSlice(std.heap.c_allocator, &.{ "x", "w_q", "scales", "inds", "offsets", "K_size", "N_size" }) catch return error.OutOfMemory;
+    if (has_bias) input_names.insert(std.heap.c_allocator, 3, "biases") catch return error.OutOfMemory;
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(input_names.items.ptr, input_names.items.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        SEG_QMM_NAMES[bi],
+        in_vec,
+        out_vec,
+        SEG_QMM_SOURCES[bi],
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    seg_qmm_kernels[bi] = kernel;
+    return kernel;
+}
+
+/// Segment-major quantized matmul over the sorted routing: one threadgroup
+/// per (segment, output row n), 32 lanes split K, the segment's M rows loop
+/// through registers so the expert's weight row is fetched once. Inputs:
+/// `x` [N_total, K] (bf16/fp16, rows in sorted_inds order), `w_q`/`scales`
+/// (+`biases`) the affine bank [E, N_out, ...], `inds` [N_total] uint32
+/// sorted bank rows, `offsets` [S+1] uint32 segment starts. Returns
+/// [N_total, N_out] in x's dtype.
+fn segmentedQmm(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: ?mlx.mlx_array,
+    inds: mlx.mlx_array,
+    offsets: mlx.mlx_array,
+    n_total: usize,
+    n_out: usize,
+    n_segments: usize,
+    bits: u32,
+    group_size: u32,
+    xd: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    const has_bias = bi != null;
+    const kernel = try getSegQmmKernel(has_bias);
+    const K_size = cachedScalarInt(@intCast(@divExact(@as(u32, @intCast(mlx.getShape(w)[2])) * 32, bits)));
+    const N_size = cachedScalarInt(@intCast(n_out));
+    var inputs = std.ArrayList(mlx.mlx_array).empty;
+    defer inputs.deinit(std.heap.c_allocator);
+    try inputs.append(std.heap.c_allocator, x);
+    try inputs.append(std.heap.c_allocator, w);
+    try inputs.append(std.heap.c_allocator, sc);
+    if (has_bias) try inputs.append(std.heap.c_allocator, bi.?);
+    try inputs.append(std.heap.c_allocator, inds);
+    try inputs.append(std.heap.c_allocator, offsets);
+    try inputs.append(std.heap.c_allocator, K_size);
+    try inputs.append(std.heap.c_allocator, N_size);
+    const inputs_vec = mlx.mlx_vector_array_new_data(inputs.items.ptr, inputs.items.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ @intCast(n_total), @intCast(n_out) };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, @intCast(n_out), @intCast(n_segments)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
+
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    if (!seg_qmm_engaged) {
+        seg_qmm_engaged = true;
+        log.info("[moe] segmented prefill qmm engaged (N_out={d}, bits={d}, gs={d})\n", .{ n_out, bits, group_size });
+    }
+    return y;
+}
+
+/// Geometry gate for the segmented prefill kernel: affine quant only (the
+/// nvfp4 body differs), the output-row count must tile across 32 lanes
+/// (N_out % 32 == 0 — gate/up inter=640 and down hidden=2560 both qualify),
+/// and the weight must be the [E, N_out, KP] 3-D bank.
+fn segQmmShapeOk(w: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, n_out: u32) bool {
+    if (mode != .affine) return false;
+    if (bits != 2 and bits != 4 and bits != 8) return false;
+    if (group_size == 0 or group_size % (32 / bits) != 0) return false;
+    if (@rem(n_out, 32) != 0) return false;
+    const wsh = mlx.getShape(w);
+    return wsh.len == 3;
+}
+
+
 //
 // The decode expert path ran gate gather -> up gather -> activation as three
 // dispatches, all on the critical chain into down_proj. This computes BOTH dot
