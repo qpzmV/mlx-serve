@@ -471,6 +471,9 @@ pub const ServerConfig = struct {
     /// hardcoded fallback. Explicit request body fields always win. See
     /// `resolveSamplingDefault`.
     default_temperature: ?f32 = null,
+    /// `--max-temperature`: server-side ceiling applied to EVERY request's
+    /// temperature, explicit client values included (see clampTemperature).
+    max_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
     /// `--mtp`: force the native MTP head ON for MoE targets too. The
@@ -486,6 +489,20 @@ pub const ServerConfig = struct {
 /// value of 0 (greedy / disabled) is a value, not an omission.
 fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T, fallback: T) T {
     return request orelse cli orelse gen_config orelse fallback;
+}
+
+/// Server-side temperature CEILING (`--max-temperature`): applies AFTER
+/// `resolveSamplingDefault`, so it caps even EXPLICIT client-requested values.
+/// Rationale: clients hardcode their own sampling truth (Codex always sends
+/// temperature=1.0), and a heavily-quantized checkpoint can turn that
+/// operating point pathological on long sessions — 4-bit lm_head logit noise
+/// inflates tail probabilities (early `<|im_end|>`) and feeds degenerate
+/// repetition loops at 30k+ contexts. A local engine is entitled to a
+/// server-side policy for a known-bad operating point; the request log shows
+/// the clamped value.
+fn clampTemperature(t: f32, cap: ?f32) f32 {
+    const c = cap orelse return t;
+    return @min(t, c);
 }
 
 /// The per-request `enable_mtp` default, for a request that omitted the field.
@@ -5248,7 +5265,7 @@ fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const temperature = clampTemperature(resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0), server_config.max_temperature);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
@@ -5802,7 +5819,7 @@ fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const temperature = clampTemperature(resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0), server_config.max_temperature);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
@@ -11854,7 +11871,7 @@ fn handleAnthropicMessages(
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const temperature = clampTemperature(resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0), server_config.max_temperature);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
@@ -13531,7 +13548,7 @@ fn handleResponses(
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
-    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const temperature = clampTemperature(resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0), server_config.max_temperature);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);

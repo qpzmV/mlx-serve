@@ -117,6 +117,13 @@ fn printUsage(io: std.Io) void {
         \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
         \\                      Serve: default for requests that omit `temperature`
         \\                      (otherwise the model's generation_config.json, then 1.0)
+        \\  --max-temperature <f>
+        \\                      Serve-mode CEILING applied to every request's
+        \\                      temperature, explicit client values included.
+        \\                      For clients that hardcode their own sampling
+        \\                      truth (Codex sends 1.0) on checkpoints where that
+        \\                      operating point degrades (4-bit lm_head noise:
+        \\                      early stop tokens, repetition loops). e.g. 0.6
         \\  --top-p <f>         Serve-mode default top_p for requests that omit it
         \\                      (otherwise generation_config.json, then 1.0 = off)
         \\  --top-k <n>         Serve-mode default top_k for requests that omit it
@@ -501,6 +508,7 @@ pub fn main(init: std.process.Init) !void {
     // doubles as the offline --prompt sampling temp, so track whether it was
     // explicitly given — only then does it become the serve default.
     var temp_explicit = false;
+    var max_temperature: ?f32 = null;
     var top_p_flag: ?f32 = null;
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
@@ -611,6 +619,9 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             temperature = try std.fmt.parseFloat(f32, args[i]);
             temp_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--max-temperature") and i + 1 < args.len) {
+            i += 1;
+            max_temperature = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, args[i], "--top-p") and i + 1 < args.len) {
             i += 1;
             top_p_flag = try std.fmt.parseFloat(f32, args[i]);
@@ -1513,6 +1524,7 @@ pub fn main(init: std.process.Init) !void {
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
             .default_temperature = if (temp_explicit) temperature else null,
+            .max_temperature = max_temperature,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
             .default_enable_pld = cli_pld.enable,

@@ -226,3 +226,20 @@ JSON 对象（否则整条响应体会畸形）。
 - 声明工具调用照常工作（read_file 路径回归通过）；
 - 透传路径与已验证的声明路径代码等价（仅去掉 continue）；
 - 采样 3 次未诱导出幻觉名（temp=1.0 随机），逻辑等价性由回归覆盖。
+
+## 2026-09-06 Codex 复读机循环缓解：新增 `--max-temperature` 服务端温度上限
+
+### 背景
+Codex 温度硬编码 1.0（二进制无配置键，`temperature` 仅存在于 MCP 协议字段），
+30k+ 长会话 + 4-bit lm_head 量化噪声下触发退化重复循环（loop-stop 在 4753 token
+切断，finish=length），Codex 界面表现为"戛然停止无反应"（内容全在折叠 thinking 里）。
+Codex 侧温度不可配置 → 引擎侧加服务端上限。
+
+### 实现
+`--max-temperature <f>`：在 `resolveSamplingDefault` **之后**对每个请求的温度取
+min（显式客户端值也钳），四处采样入口（chat/completions、responses、messages、
+embeddings 相关面）统一收口；`computer_call`/工具调用路径不受影响。启动示例：
+`--max-temperature 0.6`。
+
+### 验证
+客户端显式发 temperature=1.0，服务日志显示 `temp=0.60`——钳制生效。
