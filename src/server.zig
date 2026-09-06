@@ -3354,13 +3354,23 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     if (effective_ctx == 0) return max_tokens;
     const prompt: u32 = @intCast(@min(prompt_len, effective_ctx));
     if (prompt >= effective_ctx) return 1; // at least 1 token
+    // Reserve completion headroom: letting ONE turn generate all the way to
+    // the context wall is a cascade trigger — the client reads for most of an
+    // hour (168k tokens @ ~39 tok/s measured), then echoes the blob back,
+    // pushing the next request past the ctx limit where auto-compaction's
+    // own prefill (94k-262k @ ~190 tok/s) overruns every client read timeout
+    // and the turn dies as `0+0 [client_disconnect]`. Keep ~6% of ctx (min
+    // 2k) as headroom so the follow-up turn — including its compaction
+    // prefill — stays inside the window the client is willing to wait for.
+    const headroom: u32 = @max(effective_ctx / 16, 2048);
     const remaining = effective_ctx - prompt;
-    if (remaining < max_tokens / 4) {
-        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
+    const budget = if (remaining > headroom) remaining - headroom else remaining / 2;
+    if (budget < max_tokens / 4) {
+        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}, headroom={d}) — tool call arguments may be truncated\n", .{ budget, max_tokens, prompt, effective_ctx, headroom });
     }
-    if (max_tokens > remaining) {
-        log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d})\n", .{ max_tokens, remaining, effective_ctx, prompt });
-        return remaining;
+    if (max_tokens > budget) {
+        log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d}, headroom={d})\n", .{ max_tokens, budget, effective_ctx, prompt, headroom });
+        return budget;
     }
     return max_tokens;
 }

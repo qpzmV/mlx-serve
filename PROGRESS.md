@@ -243,3 +243,23 @@ embeddings 相关面）统一收口；`computer_call`/工具调用路径不受�
 
 ### 验证
 客户端显式发 temperature=1.0，服务日志显示 `temp=0.60`——钳制生效。
+
+## 2026-09-06 "压缩上下文卡死"根因与修复：单回合生成预留 headroom
+
+### 事故链（pi 会话实测日志）
+1. "dump 内容"任务 → 模型把两个回答全文塞进一次工具调用参数（47,651 token）→
+   回填后 prompt 滚到 94k；
+2. 下一回合生成 168,104 token 撞满 ctx 墙（clampMaxTokens 把 ctx−prompt 全给生成，
+   零余量；72 分钟）；
+3. 客户端回填后发"自动压缩上下文"请求 → 压缩 prefill 94k~262k @ ~190 tok/s =
+   8~22 分钟 → **客户端读超时先到**，三次重试全部 `0+0 [client_disconnect]` →
+   "压缩一直卡着"。Codex 的压缩同机制同死法。
+
+### 排除项（都有实验）
+超限 prompt 立即 400（stream/非 stream 都正常拒绝）；撞墙 [length] 后 slot 释放
+正常（小 ctx 3 轮 stream 撞墙 + followup 全过）；MTP disabled 是 EV 自适应非 bug。
+
+### 修复
+`clampMaxTokens` 预留完成 headroom：`max( ctx/16, 2048 )` 不再给单回合生成——
+后续回填轮（含压缩 prefill）留在客户端愿意等待的窗口内。验证：ctx=4096、
+prompt=14 时 max_gen 4082 → 2034，日志带 headroom 标记。
