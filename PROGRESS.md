@@ -263,3 +263,35 @@ embeddings 相关面）统一收口；`computer_call`/工具调用路径不受�
 `clampMaxTokens` 预留完成 headroom：`max( ctx/16, 2048 )` 不再给单回合生成——
 后续回填轮（含压缩 prefill）留在客户端愿意等待的窗口内。验证：ctx=4096、
 prompt=14 时 max_gen 4082 → 2034，日志带 headroom 标记。
+
+## 2026-09-06 prefill 瓶颈挖掘：MoE 占 80.5%，瓶颈在 MLX gather_qmm kernel
+
+### 吞吐衰减曲线（ Vontra 4bit，expert-stream，冷启动池）
+6.6k=334 / 26.5k=370 / 53k=281 / 106k=186 tok/s——53k 后明显衰减。
+
+### 组件占比（QWEN4_PROFILE_FWD=all，25k prompt，11 chunk 聚合）
+| 组件 | 时间 | 占比 |
+|---|---|---|
+| **mlp (MoE)** | **54.3s** | **80.5%** |
+| attn (full+QSA) | 6.0s | 8.9% |
+| gdn (线性注意力) | 4.2s | 6.2% |
+| hcRead+hcWrite | 2.7s | 3.9% |
+| ple (n-gram) | 0.3s | 0.4% |
+
+### MoE 内部再拆（EXPERT_STATS）
+- 磁盘只占 ~11%：miss 率 21%（21.7k 次重读，65GB），ReadPool 并行已打满
+  8.9GB/s 有效带宽；per_fill 347µs；
+- 其余 ~89% 是 GPU 端 gather_qmm 计算：prefill sorted 路径走 `mlx_gather_qmm`
+  （sorted=true 流优化已开）——**与 mlx-lm 跑同款模型用的是同一个 MLX kernel**；
+- `--prefill-chunk 8192` 仅快 3.6%（unique 专家在 4096 chunk 时已近饱和，
+  每对 token-expert 的权重流量不再随 chunk 缩减）。
+
+### 结论与出路
+prefill 瓶颈不在本仓库代码（采样/调度/磁盘/注意力全部健康），而在 MLX 的
+quantized gather_qmm kernel：每 (token,expert) 对一次 M=1 的行级 qmv，虽然
+sorted 流优化利用了权重局部性，但相对"按 expert 分段的 M=91 宽 matmul"
+理论上还有 3-5 倍空间。出路：
+1. 向 MLX 上游报 issue/贡献 segmented quantized MoE matmul（长周期）；
+2. 短期接受 193 tok/s，配合 headroom(8cbf222) 防窗口吃满 + 会话卫生，
+   压缩在 <100k 上下文点触发时 prefill 5-8 分钟内可完成（客户端可等待）；
+3. 换 lm_head/专家精度更高的包（oQ4）可同时缓解采样病与计算开销。
