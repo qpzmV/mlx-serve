@@ -11150,6 +11150,8 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
 
     moe_rows_fused_override = true;
     defer moe_rows_fused_override = null;
+    moe_verify_rows_override = false;
+    defer moe_verify_rows_override = null;
     try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false));
@@ -11157,6 +11159,8 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false));
+    // The verify-width arm does not leak into the batched tick either.
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 2, 10, false));
 
     try t.expect(!qsaScoreFusedActiveFor(2, 4, 128));
     try t.expect(!qsaScoreFusedActiveFor(4, 4, 128));
@@ -13965,8 +13969,8 @@ pub fn qkvAttnDecodeKernel(
         .dtype = qdt,
     };
     if (qkv_dec_cfg == null or !std.meta.eql(qkv_dec_cfg_key, key)) {
-        if (qkv_dec_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const ml_shape = [_]c_int{ h_q, nblk };
         const o_shape = [_]c_int{ h_q, nblk, dv };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
@@ -13982,6 +13986,11 @@ pub fn qkvAttnDecodeKernel(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLOCK", block));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", @intFromBool(has_mask)));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (qkv_dec_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qkv_dec_cfg = config;
         qkv_dec_cfg_key = key;
     }
@@ -14364,8 +14373,8 @@ pub fn qkvAttnVerifyKernel(
         .dtype = qdt,
     };
     if (qkv_ver_cfgs[slot] == null or !std.meta.eql(qkv_ver_cfg_keys[slot], key)) {
-        if (qkv_ver_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const rows_total: c_int = h_q * t_q;
         const ml_shape = [_]c_int{ rows_total, nblk };
         const o_shape = [_]c_int{ rows_total, nblk, dv };
@@ -14382,6 +14391,11 @@ pub fn qkvAttnVerifyKernel(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TQ", t_q));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLOCK", block));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (qkv_ver_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qkv_ver_cfgs[slot] = config;
         qkv_ver_cfg_keys[slot] = key;
     }
@@ -28322,9 +28336,15 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// The fused-rows MoE arm at decode (B >= 2). It runs ahead of the sorted
+    /// The fused-rows MoE arm at decode. It runs ahead of the sorted
     /// chain, which stays the fallback whenever this declines: a decline is never
     /// a wrong answer, only the sorted chain's extra dispatches.
+    ///
+    /// `rows = B * S` is the kernel's row axis — one TOKEN — and its expert axis
+    /// is that token's `K` slots. Both the batched tick (S == 1) and the verify
+    /// width (B == 1) collapse onto it the same way, so the flattening below is
+    /// shape bookkeeping only: every per-row arithmetic is the solo single-row
+    /// call's, on unchanged indices and scores.
     fn moeDecodeGatherQmvRows(
         self: *Transformer,
         out: *mlx.mlx_array,
@@ -28339,20 +28359,23 @@ pub const Transformer = struct {
         D: c_int,
         K: c_int,
         B: c_int,
+        S: c_int,
     ) !bool {
         if (!gatherQmvDownReduceRowsEligible(self.config.hidden_act, gate_qp, up_qp, down_qp, D)) return false;
+        const rows: c_int = B * S;
+        if (rows < 1 or rows > 8) return false;
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
         {
             var flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(flat);
-            const kshape = [_]c_int{ B, K };
+            const kshape = [_]c_int{ rows, K };
             try mlx.check(mlx.mlx_reshape(&flat, inds, &kshape, 2, self.s));
             try mlx.check(mlx.mlx_astype(&inds_u32, flat, .uint32, self.s));
         }
         var x_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_2d);
-        const dshape = [_]c_int{ B, D };
+        const dshape = [_]c_int{ rows, D };
         try mlx.check(mlx.mlx_reshape(&x_2d, expert_x, &dshape, 2, self.s));
 
         const act_3d = (try gatherQmvGateUpRows(
@@ -28372,7 +28395,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(act_3d);
         var scores_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scores_2d);
-        const kshape2 = [_]c_int{ B, K };
+        const kshape2 = [_]c_int{ rows, K };
         try mlx.check(mlx.mlx_reshape(&scores_2d, norm_scores, &kshape2, 2, self.s));
         const sum_2d = (try gatherQmvDownReduceRows(
             self.s,
@@ -28388,9 +28411,13 @@ pub const Transformer = struct {
         )) orelse return false;
         defer _ = mlx.mlx_array_free(sum_2d);
         const hidden = mlx.getShape(sum_2d)[1];
-        const bsh_shape = [_]c_int{ B, 1, hidden };
+        const bsh_shape = [_]c_int{ B, S, hidden };
         try mlx.check(mlx.mlx_reshape(out, sum_2d, &bsh_shape, 3, self.s));
         reduced.* = true;
+        if (!moe_verify_rows_engaged and S > 1) {
+            moe_verify_rows_engaged = true;
+            log.info("[moe] verify-width rows arm engaged: S={d} rows={d} topk={d} (MLX_SERVE_MOE_VERIFY_ROWS=0 restores the sorted chain)\n", .{ S, rows, K });
+        }
         return true;
     }
 
@@ -28564,7 +28591,7 @@ pub const Transformer = struct {
 
         if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
-            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B))
+            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             moe_rows_fused_layers +%= 1;
             cost_arm = 1;
@@ -31933,9 +31960,8 @@ fn moeRouterTopK(
     };
     const slot = &router_cfg_cache[@backingInt(mode)];
     if (slot.cfg.ctx == null or !std.meta.eql(slot.key, key)) {
-        if (slot.cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(slot.cfg);
-        if (slot.scale_arr.ctx != null) _ = mlx.mlx_array_free(slot.scale_arr);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         // Outputs keep the caller's leading dims with the expert axis replaced by K.
         var out_shape: [4]c_int = undefined;
         for (lsh[0 .. lsh.len - 1], 0..) |d, i| out_shape[i] = d;
@@ -31954,7 +31980,13 @@ fn moeRouterTopK(
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSZ", @divExact(num_experts, n_group)));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPKG", topk_group));
         }
+        // BUILD-THEN-SWAP (CLAUDE.md): neither cached handle is released until the
+        // whole replacement exists, so a failure above cannot leave a freed config
+        // or a freed scale array behind for the next call to reuse or free again.
+        const previous = slot.*;
         slot.* = .{ .cfg = config, .key = key, .scale_arr = mlx.mlx_array_new_float(route_scale) };
+        if (previous.cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(previous.cfg);
+        if (previous.scale_arr.ctx != null) _ = mlx.mlx_array_free(previous.scale_arr);
     }
     const config = slot.cfg;
 
@@ -32620,8 +32652,8 @@ pub fn fusedQkNormRope(
 
     const key = QkFusedCfgKey{ .hq = hq, .hk = hk, .rd = rd, .scaled = ms != null, .dtype = dt };
     if (qk_fused_cfg == null or !std.meta.eql(qk_fused_cfg_key, key)) {
-        if (qk_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const oq_shape = [_]c_int{ 1, hq, 1, 128 };
         const ok_shape = [_]c_int{ 1, hk, 1, 128 };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oq_shape, 4, dt));
@@ -32632,6 +32664,11 @@ pub fn fusedQkNormRope(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HQ", hq));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", rd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SCALED", if (ms != null) 1 else 0));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (qk_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qk_fused_cfg = config;
         qk_fused_cfg_key = key;
     }
@@ -32942,8 +32979,14 @@ fn gdnPreworkEnabled() bool {
 pub var gdn_decode_fused_override: ?bool = null; // test seam
 var gdn_decode_fused_env: ?bool = null;
 
-/// The decode-width GDN fusions (prework at S < 3, in-kernel gate/beta, the
-/// norm-gate epilogue). Off = the pre-fusion decode path, op for op.
+/// The DECODE-width GDN fusions: the packed prework at S < 3, its in-kernel
+/// gate/beta, and the norm-gate epilogue. Off is the pre-fusion decode path
+/// ONLY at S < 3 — the same packed prework still serves verify/batched widths
+/// (S 1..9) with its gate/beta left to the composed chain, so OFF and the
+/// composed chain deliberately differ above S = 2. A pure "fusion vs
+/// pre-fusion" A/B arms BOTH switches (`MLX_SERVE_GDN_PREWORK=0` removes the
+/// packed kernel at every width); reading this flag alone as that axis is a
+/// mixed arm.
 pub fn gdnDecodeFusedEnabled() bool {
     if (gdn_decode_fused_override) |v| return v;
     if (gdn_decode_fused_env) |v| return v;
@@ -33016,53 +33059,121 @@ pub const GdnPreworkArgs = struct {
     batch: c_int = 1,
 };
 
+/// Rows of conv state the packed prework keeps (the kernel's `NKEEP`): one
+/// number for both the window shift it encodes and the eligibility check.
+const GDN_PREWORK_NKEEP: c_int = 3;
+
+/// Why the packed prework declined. Logged ONCE per reason: the kernel used to
+/// return null with nothing in the log, so a cap or geometry rejection made
+/// the fused path vanish at batched widths with no signal at all (the composed
+/// chain that takes over is ~8 dispatches slower per layer). Bit r = reason r
+/// already reported, so a first decline never masks a different later one.
+const GdnPreworkDecline = enum(u4) {
+    width,
+    rows_cap,
+    head_geometry,
+    input_dtype,
+    conv_w_shape,
+    qkv_shape,
+    b_shape,
+    a_shape,
+    conv_state_shape,
+};
+
+var gdn_prework_declined: u32 = 0;
+
+/// The kernel's `return null` (caller keeps the composed chain), with the
+/// one-shot reason log.
+fn declinePrework(in: GdnPreworkArgs, reason: GdnPreworkDecline, detail: []const u8) ?GdnPrework {
+    const bit = @as(u32, 1) << @as(u5, @intFromEnum(reason));
+    if (gdn_prework_declined & bit == 0) {
+        gdn_prework_declined |= bit;
+        log.info("[gdn] packed prework declined ({s}{s}{s}): Hk={d} Hv={d} dk={d} dv={d} S={d} B={d}\n", .{
+            @tagName(reason),
+            if (detail.len == 0) "" else ": ",
+            detail,
+            in.hk,
+            in.hv,
+            in.dk,
+            in.dv,
+            in.seq,
+            in.batch,
+        });
+    }
+    return null;
+}
+
+/// Build the packed-prework config. ANY failure in the build drops the
+/// half-built handle and reports; the caller's cached handle is untouched.
+/// Freeing the cached one up front instead left a dangling pointer behind a
+/// matching key — the next call applied a freed config (same key) or freed it
+/// a second time (different key) — which is the class `CLAUDE.md` names:
+/// "a fallible re-init BEHIND a deinit leaves a freed object on the error path
+/// — build first, then swap" / "a handle freed before a fallible op is reset
+/// AT the free".
+fn buildPreworkCfg(key: GdnPreworkCfgKey, dk: c_int, dv: c_int) !mlx.mlx_fast_metal_kernel_config {
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const q_shape = [_]c_int{ key.batch, key.seq, key.hk, dk };
+    const v_shape = [_]c_int{ key.batch, key.seq, key.hv, dv };
+    const st_shape = [_]c_int{ key.batch, GDN_PREWORK_NKEEP, key.c };
+    const g_shape = [_]c_int{ key.batch, key.seq, key.hv };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &v_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &st_shape, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, key.batch * key.seq, 2 * key.hk + key.hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+    const ints = .{ .{ "HK", key.hk }, .{ "HV", key.hv }, .{ "DK", dk }, .{ "DV", dv }, .{ "NKEEP", GDN_PREWORK_NKEEP }, .{ "C", key.c }, .{ "S", key.seq }, .{ "QSTRIDE", key.qs }, .{ "QOFF", key.qo }, .{ "BSTRIDE", key.bs }, .{ "BOFF", key.bo }, .{ "ASTRIDE", key.as }, .{ "AOFF", key.ao } };
+    inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+    return config;
+}
+
+/// Install-on-miss with BUILD-THEN-SWAP: the previous entry is released AT the
+/// swap, after the new build has succeeded. Returns the handle to apply with,
+/// so the apply never re-reads the global.
+fn ensurePreworkCfg(key: GdnPreworkCfgKey, dk: c_int, dv: c_int) !mlx.mlx_fast_metal_kernel_config {
+    if (gdn_prework_cfg) |c| {
+        if (std.meta.eql(gdn_prework_cfg_key, key)) return c;
+    }
+    const config = try buildPreworkCfg(key, dk, dv);
+    const previous = gdn_prework_cfg;
+    gdn_prework_cfg = config;
+    gdn_prework_cfg_key = key;
+    if (previous) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    return config;
+}
+
 /// One fused dispatch for the GDN prework at S 1..9 x B batched slots
 /// (batch*seq <= GDN_FUSED_MAX_ROWS; per-head gate archs only). Null →
 /// caller keeps the composed chain. The caller owns all six outputs (and
 /// installs `conv_state` into the SSM cache entry).
 pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     if (!gdnPreworkEnabled()) return null;
-    if (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS) return null;
+    if (in.seq < 1 or in.seq > 9) return declinePrework(in, .width, "seq out of 1..9");
+    if (in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS) return declinePrework(in, .rows_cap, "batch*seq > cap");
     if (in.seq < 3 and !gdnDecodeFusedEnabled()) return null;
-    if (in.dk != 128 or in.dv != 128) return null;
+    if (in.dk != 128 or in.dv != 128) return declinePrework(in, .head_geometry, "dk/dv != 128");
     inline for (.{ in.qkv, in.b, in.a, in.conv_state, in.conv_w, in.dt_bias }) |arr| {
-        if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
+        if (mlx.mlx_array_dtype(arr) != .bfloat16) return declinePrework(in, .input_dtype, @tagName(mlx.mlx_array_dtype(arr)));
     }
     const wsh = mlx.getShape(in.conv_w);
-    if (wsh.len < 2 or wsh[1] != 4) return null;
+    if (wsh.len < 2 or wsh[1] != 4) return declinePrework(in, .conv_w_shape, "conv_w");
     const c_dim: c_int = in.hk * in.dk * 2 + in.hv * in.dv;
     const qsh = mlx.getShape(in.qkv);
-    if (qsh.len != 3 or qsh[0] != in.batch or qsh[1] != in.seq or qsh[2] != in.qkv_stride or in.qkv_off + c_dim > in.qkv_stride) return null;
+    if (qsh.len != 3 or qsh[0] != in.batch or qsh[1] != in.seq or qsh[2] != in.qkv_stride or in.qkv_off + c_dim > in.qkv_stride) return declinePrework(in, .qkv_shape, "qkv");
     const bsh = mlx.getShape(in.b);
-    if (bsh.len != 3 or bsh[0] != in.batch or bsh[1] != in.seq or bsh[2] != in.b_stride or in.b_off + in.hv > in.b_stride) return null;
+    if (bsh.len != 3 or bsh[0] != in.batch or bsh[1] != in.seq or bsh[2] != in.b_stride or in.b_off + in.hv > in.b_stride) return declinePrework(in, .b_shape, "b");
     const ash = mlx.getShape(in.a);
-    if (ash.len != 3 or ash[0] != in.batch or ash[1] != in.seq or ash[2] != in.a_stride or in.a_off + in.hv > in.a_stride) return null;
+    if (ash.len != 3 or ash[0] != in.batch or ash[1] != in.seq or ash[2] != in.a_stride or in.a_off + in.hv > in.a_stride) return declinePrework(in, .a_shape, "a");
     const csh = mlx.getShape(in.conv_state);
-    if (csh.len != 3 or csh[0] != in.batch or csh[1] != 3 or csh[2] != c_dim) return null;
+    if (csh.len != 3 or csh[0] != in.batch or csh[1] != GDN_PREWORK_NKEEP or csh[2] != c_dim) return declinePrework(in, .conv_state_shape, "conv_state");
 
-    const nkeep: c_int = 3;
     const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off };
-    if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
-        if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        const config = mlx.mlx_fast_metal_kernel_config_new();
-        const q_shape = [_]c_int{ in.batch, in.seq, in.hk, in.dk };
-        const v_shape = [_]c_int{ in.batch, in.seq, in.hv, in.dv };
-        const st_shape = [_]c_int{ in.batch, nkeep, c_dim };
-        const g_shape = [_]c_int{ in.batch, in.seq, in.hv };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &v_shape, 4, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &st_shape, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &g_shape, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, in.batch * in.seq, 2 * in.hk + in.hv));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "S", in.seq }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off } };
-        inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
-        gdn_prework_cfg = config;
-        gdn_prework_cfg_key = key;
-    }
+    const config = try ensurePreworkCfg(key, in.dk, in.dv);
 
     const kernel = try getGdnPreworkKernel();
     const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias };
@@ -33070,7 +33181,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_prework_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 6) return error.MetalKernelBadOutputCount;
     var out = GdnPrework{
         .q = mlx.mlx_array_new(),
@@ -33149,6 +33260,36 @@ fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+/// Build the norm-gate config. Same build-then-swap rule as
+/// `buildPreworkCfg`: a mid-way failure drops the half-built handle and
+/// reports, and the cached handle is never freed before a fallible op.
+fn buildNormGateCfg(key: GdnNormGateCfgKey, dv: c_int) !mlx.mlx_fast_metal_kernel_config {
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const out_shape = [_]c_int{ key.batch, key.seq, key.hv * dv };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, key.batch * key.seq, key.hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+    const ints = .{ .{ "HV", key.hv }, .{ "DV", dv }, .{ "ZSTRIDE", key.zs }, .{ "ZOFF", key.zo } };
+    inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(key.swish)));
+    return config;
+}
+
+/// Install-on-miss with BUILD-THEN-SWAP (see `ensurePreworkCfg`).
+fn ensureNormGateCfg(key: GdnNormGateCfgKey, dv: c_int) !mlx.mlx_fast_metal_kernel_config {
+    if (gdn_normgate_cfg) |c| {
+        if (std.meta.eql(gdn_normgate_cfg_key, key)) return c;
+    }
+    const config = try buildNormGateCfg(key, dv);
+    const previous = gdn_normgate_cfg;
+    gdn_normgate_cfg = config;
+    gdn_normgate_cfg_key = key;
+    if (previous) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    return config;
+}
+
 /// `rms_norm(y) * silu(z)` flattened to [B, S, Hv*Dv]. Null → composed chain.
 pub fn gdnNormGateFused(
     s: mlx.mlx_stream,
@@ -33165,7 +33306,15 @@ pub fn gdnNormGateFused(
     seq: c_int,
 ) !?mlx.mlx_array {
     if (!gdnDecodeFusedEnabled()) return null;
-    if (dv != 128 or seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS) return null;
+    if (dv != 128 or seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS) {
+        // The cap/geometry rejects are as silent as they are in the prework —
+        // one shot per process so an A/B that loses the fusion says so.
+        if (!gdn_normgate_declined) {
+            gdn_normgate_declined = true;
+            log.info("[gdn] fused norm-gate declined: dv={d} S={d} B={d} rows={d} cap={d}\n", .{ dv, seq, batch, batch * seq, GDN_FUSED_MAX_ROWS });
+        }
+        return null;
+    }
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if (mlx.mlx_array_dtype(arr) != .bfloat16) {
             if (!gdn_normgate_declined) {
@@ -33185,27 +33334,14 @@ pub fn gdnNormGateFused(
         return null;
     }
     const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish };
-    if (gdn_normgate_cfg == null or !std.meta.eql(gdn_normgate_cfg_key, key)) {
-        if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        const config = mlx.mlx_fast_metal_kernel_config_new();
-        const out_shape = [_]c_int{ batch, seq, hv * dv };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off } };
-        inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
-        gdn_normgate_cfg = config;
-        gdn_normgate_cfg_key = key;
-    }
+    const config = try ensureNormGateCfg(key, dv);
     const kernel = try getGdnNormGateKernel();
     const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_normgate_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
@@ -33286,8 +33422,8 @@ pub fn fusedQkNormRope256(
 
     const key = Qk256CfgKey{ .hq = hq, .hk = hk, .seq = seq, .rd = rd, .dtype = dt };
     if (qk256_fused_cfg == null or !std.meta.eql(qk256_fused_cfg_key, key)) {
-        if (qk256_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const oq_shape = [_]c_int{ 1, hq, seq, 256 };
         const ok_shape = [_]c_int{ 1, hk, seq, 256 };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oq_shape, 4, dt));
@@ -33299,6 +33435,11 @@ pub fn fusedQkNormRope256(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "S", seq));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", rd));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (qk256_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qk256_fused_cfg = config;
         qk256_fused_cfg_key = key;
     }
@@ -34170,14 +34311,19 @@ pub fn fusedAddRmsNormUngated(
 
     const key = AddNormCfgKey{ .shape = ShapeKey.from(ash), .dtype = dt };
     if (add_rmsnorm_cfg == null or !std.meta.eql(add_rmsnorm_cfg_key, key)) {
-        if (add_rmsnorm_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, ash.len, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, tg, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "AXIS", axis));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (add_rmsnorm_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         add_rmsnorm_cfg = config;
         add_rmsnorm_cfg_key = key;
     }
@@ -34318,8 +34464,8 @@ fn fusedAttnGate(
     if (@rem(width, tg) != 0) return null;
     const key = AttnGateCfgKey{ .shape = ShapeKey.from(ash), .nh = nh, .dtype = dt };
     if (attn_gate_cfg == null or !std.meta.eql(attn_gate_cfg_key, key)) {
-        if (attn_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, ash.ptr, 3, dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, width, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
@@ -34327,6 +34473,11 @@ fn fusedAttnGate(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NH", nh));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HD", hd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TG", tg));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (attn_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         attn_gate_cfg = config;
         attn_gate_cfg_key = key;
     }
@@ -34499,14 +34650,19 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(ni + 31, 32) * 32));
     const key = SwigluCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
     if (swiglu_cfg == null or !std.meta.eql(swiglu_cfg_key, key)) {
-        if (swiglu_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, gsh.ptr, gsh.len, dt));
         // Grid is rounded UP to the threadgroup so the launch is uniform; the
         // kernel's own bound check drops the tail threads.
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ni + tg - 1, tg) * tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (swiglu_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         swiglu_cfg = config;
         swiglu_cfg_key = key;
     }
@@ -35337,11 +35493,8 @@ pub fn hcReadFused(
 
     const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows };
     if (hc_fused_cfgs[0] == null or !std.meta.eql(hc_fused_key, key)) {
-        for (&hc_fused_cfgs) |*c| if (c.*) |cfg| {
-            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-            c.* = null;
-        };
         const cn = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cn);
         const k_shape = [_]c_int{rows * K};
         const hc_shape = [_]c_int{rows * hc};
         const hchc_shape = [_]c_int{rows * hc * hc};
@@ -35356,8 +35509,8 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "INJ", inj));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "WR", wr));
-        hc_fused_cfgs[0] = cn;
         const cd = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cd);
         const act_shape = [_]c_int{rows * R};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &act_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &hc_shape, 1, xd));
@@ -35369,8 +35522,8 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "HC", hc));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "R", R));
-        hc_fused_cfgs[1] = cd;
         const cu = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cu);
         const mixed_shape = [_]c_int{rows * hidden};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cu, &mixed_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cu, 32, hidden, rows));
@@ -35381,8 +35534,15 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "HC", hc));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "R", R));
-        hc_fused_cfgs[2] = cu;
+        // BUILD-THEN-SWAP (CLAUDE.md): all three configs are built before any cached
+        // slot is touched. Installing them one by one left a failure with slot 0 set
+        // and the key stale, which the `.?!` reads below would then dereference.
+        const previous = hc_fused_cfgs;
+        hc_fused_cfgs = .{ cn, cd, cu };
         hc_fused_key = key;
+        for (previous) |c| {
+            if (c) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
+        }
     }
     if (hc_fused_eps == null or hc_fused_eps_val != eps) {
         if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
@@ -35552,8 +35712,8 @@ pub fn gatherQmvGateUp(
 
     const key = GateUpCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
     if (gateup_cfg == null or !std.meta.eql(gateup_cfg_key, key)) {
-        if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, topk));
@@ -35562,6 +35722,11 @@ pub fn gatherQmvGateUp(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         gateup_cfg = config;
         gateup_cfg_key = key;
     }
@@ -35692,16 +35857,59 @@ fn moeRowsFusedEnabled() bool {
     return enabled;
 }
 
+/// Verify-width rows arm (B == 1, 2 <= S <= 8): OPT-IN via
+/// MLX_SERVE_MOE_VERIFY_ROWS=1 until a same-boot A/B says otherwise.
+///
+/// The fused rows kernels are a validated lane — bit-identical per row to the
+/// solo single-row call, hermetic tests, and the batched-decode shape already
+/// ships them. The verify shape is the SAME grouped (token, expert) layout:
+/// flattening (B, S) into the kernel's row axis leaves every per-row
+/// arithmetic untouched, because a row is one token's top-K slots in both
+/// cases. The only thing that kept it out is the `S == 1` guard below.
+///
+/// It matters because a verify row on a routed-expert MoE costs its OWN expert
+/// banks, and the sorted chain it currently falls into pays `gather_qmm`'s
+/// O(bank) addressing penalty once per projection per layer (the µbench in the
+/// MoE-decode ledger). Whether the rows kernels win at verify widths is a
+/// MEASUREMENT, not a deduction: the M4 side measured a per-ROW loop flat at
+/// S=2 / -11% at S=4 (qwen-flash-next_M5_NAX_plan.md, item 3), which is a
+/// different dispatch pattern at a different row origin. Default OFF, one-shot
+/// `[moe] verify-width rows arm engaged` log so the arm is readable from its
+/// own log rather than from the env it was launched with.
+/// Test seam: `moe_verify_rows_override`.
+pub var moe_verify_rows_override: ?bool = null;
+var moe_verify_rows_env: ?bool = null;
+var moe_verify_rows_engaged = false;
+
+fn moeVerifyRowsEnabled() bool {
+    if (moe_verify_rows_override) |v| return v;
+    if (moe_verify_rows_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_ROWS");
+    const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
+    moe_verify_rows_env = enabled;
+    return enabled;
+}
+
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 
-/// ONE place decides the decode MoE arm: fused rows for S == 1 and
-/// 2 <= B <= 8 without expert bias; the single-row gatherQmv at B == 1; the
-/// sorted chain otherwise, and whenever a stand-in diagnostic wants the stock path.
+/// ONE place decides the decode MoE arm: fused rows over the 2..8 TOKEN row axis
+/// (always at the batched tick S == 1; at the verify width B == 1 only behind the
+/// opt-in switch) without expert bias; the single-row gatherQmv at B == S == 1;
+/// the sorted chain otherwise, and whenever a stand-in diagnostic wants the stock path.
+///
+/// The rows arm keys on the ROW count (`B * S`), not on B alone: the kernel's
+/// row axis is a token and its expert axis is that token's top-K in both the
+/// batched (S == 1) and the verify (B == 1) shapes. Verify widths reach it only
+/// behind `MLX_SERVE_MOE_VERIFY_ROWS=1`, and only for B == 1 — a batched tick
+/// that is ALSO drafting (B >= 2, S >= 2) still sorts, because that is the one
+/// shape whose arm choice the batched-decode measurements actually covered.
 fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool) MoeDecodeDispatchArm {
     const total_inds: c_int = B * S * K;
     const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
-    if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !has_expert_bias and
-        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down)
+    const rows: c_int = B * S;
+    if (rows >= 2 and rows <= 8 and moeRowsFusedEnabled() and !has_expert_bias and
+        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down and
+        (S == 1 or (B == 1 and moeVerifyRowsEnabled())))
         return .rows;
     if (do_sort) return .sorted;
     return .gather_qmv;
@@ -35765,8 +35973,8 @@ pub fn gatherQmvGateUpRows(
 
     const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
     if (gateup_rows_cfg == null or !std.meta.eql(gateup_rows_cfg_key, key)) {
-        if (gateup_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         const y_shape = [_]c_int{ nrows, topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 3, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, nrows * topk));
@@ -35776,6 +35984,11 @@ pub fn gatherQmvGateUpRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (gateup_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         gateup_rows_cfg = config;
         gateup_rows_cfg_key = key;
     }
@@ -35932,8 +36145,8 @@ pub fn gatherQmv(
     const key = GqmvCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .x_per_expert = x_per_expert };
     const slot = &gqmv_cfg_cache[@intFromBool(x_per_expert)];
     if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
-        if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{ topk, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, N, topk));
@@ -35941,7 +36154,10 @@ pub fn gatherQmv(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
+        // BUILD-THEN-SWAP (CLAUDE.md): the cached entry is released AT the swap.
+        const previous = slot.*;
         slot.* = .{ .cfg = cfg, .key = key };
+        if (previous.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
     }
     const config = slot.cfg.?;
 
@@ -36151,8 +36367,8 @@ pub fn gatherQmvDownReduce(
 
     const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
     if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
-        if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{N};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, 1, 1));
@@ -36164,6 +36380,11 @@ pub fn gatherQmvDownReduce(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         downred_cfg = cfg;
         downred_cfg_key = key;
     }
@@ -36361,8 +36582,8 @@ pub fn gatherQmvDownReduceRows(
 
     const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
     if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
-        if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         const y_shape = [_]c_int{ nrows, N };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(N, rows) * topk * 32, nrows, 1));
@@ -36374,6 +36595,11 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
+        // BUILD-THEN-SWAP (CLAUDE.md: "a fallible re-init BEHIND a deinit leaves a
+        // freed object on the error path"): the cached handle is released only
+        // once its replacement is fully built, so a failure above cannot leave a
+        // freed config behind for the next call to reuse or free again.
+        if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         downred_rows_cfg = cfg;
         downred_rows_cfg_key = key;
     }
@@ -42145,6 +42371,8 @@ fn moeRowsSliceRow(s: mlx.mlx_stream, x: mlx.mlx_array, i: c_int) !mlx.mlx_array
 test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     moe_rows_fused_override = true;
     defer moe_rows_fused_override = null;
+    moe_verify_rows_override = false;
+    defer moe_verify_rows_override = null;
     qwen4_standin_override = .{};
     defer qwen4_standin_override = null;
     const K: c_int = 10;
@@ -42156,11 +42384,31 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false));
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true));
     try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false));
+    // Verify widths (B == 1, S >= 2) stay on the sorted chain while the opt-in
+    // is off: the arm is a hypothesis, not a default.
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 2, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 8, K, false));
     qwen4_standin_override = .{ .moe_gateup = true };
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
     qwen4_standin_override = .{ .moe_down = true };
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
     qwen4_standin_override = .{};
+
+    // Opt-in on: the verify width reaches the rows lane over the same
+    // 2 <= rows <= 8 window the batched tick uses, and NOTHING else moves —
+    // a batched tick that is also drafting still sorts (untested shape), the
+    // row cap still fences at 9, and the B == S == 1 arm is unchanged.
+    moe_verify_rows_override = true;
+    var s: c_int = 2;
+    while (s <= 8) : (s += 1) {
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false));
+    }
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 2, K, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false));
+    // The rows cap is shared with the batched arm: 6 slots x 2 rows is 12 rows.
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(6, 2, K, false));
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {
@@ -45227,6 +45475,183 @@ test "inkling router chain parity vs reference (INKLING_FIXTURES)" {
     }
     try testing.expect(try maxAbsDiffF32(r.shared_gammas, sg_ref, s) < 1e-4);
     std.debug.print("[inkling-router] top-k select + sink weights parity ok\n", .{});
+}
+
+// Class guard for the two fused-kernel config caches (packed prework,
+// norm-gate): a rebuild that FAILS must leave the previously installed config
+// in place AND usable — build first, then swap. The shape this replaces freed
+// the cached handle BEFORE the build, so a mid-way failure left a dangling
+// pointer behind a matching key: the next call applied the freed config (same
+// key) or freed it again (different key). Driven by the `mlx.check` fault
+// injector (it fails the k-th checked call), so this walks the real error path
+// of the real builder. Hermetic: config construction is host-side, so it needs
+// no device and no stream.
+test "gdn fused config caches: a failed rebuild keeps the previous config installed" {
+    const c_w = 4 * 128 * 2 + 8 * 128;
+    const k1 = GdnPreworkCfgKey{ .hk = 4, .hv = 8, .seq = 1, .batch = 1, .c = c_w, .qs = c_w, .qo = 0, .bs = 8, .bo = 0, .as = 8, .ao = 0 };
+    const k2 = GdnPreworkCfgKey{ .hk = 4, .hv = 8, .seq = 2, .batch = 1, .c = c_w, .qs = c_w, .qo = 0, .bs = 8, .bo = 0, .as = 8, .ao = 0 };
+
+    // Module-level caches: save, reset, restore.
+    const saved_pre = gdn_prework_cfg;
+    const saved_pre_key = gdn_prework_cfg_key;
+    const saved_ng = gdn_normgate_cfg;
+    const saved_ng_key = gdn_normgate_cfg_key;
+    defer {
+        if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        gdn_prework_cfg = saved_pre;
+        gdn_prework_cfg_key = saved_pre_key;
+        gdn_normgate_cfg = saved_ng;
+        gdn_normgate_cfg_key = saved_ng_key;
+    }
+    gdn_prework_cfg = null;
+    gdn_prework_cfg_key = std.mem.zeroes(GdnPreworkCfgKey);
+    gdn_normgate_cfg = null;
+    gdn_normgate_cfg_key = std.mem.zeroes(GdnNormGateCfgKey);
+
+    const installed = try ensurePreworkCfg(k1, 128, 128);
+    try std.testing.expect(installed.ctx != null);
+
+    // A rebuild for a different shape fails at its first checked op.
+    mlx.fault.arm(1);
+    try std.testing.expectError(error.MlxError, ensurePreworkCfg(k2, 128, 128));
+    try std.testing.expect(mlx.fault.didFire());
+    mlx.fault.disarm();
+
+    // The installed entry is untouched — same handle, same key.
+    try std.testing.expect(gdn_prework_cfg.?.ctx == installed.ctx);
+    try std.testing.expect(std.meta.eql(gdn_prework_cfg_key, k1));
+
+    // A hit on it must not rebuild (an armed fault would fire if it did): under
+    // the old shape this is exactly where the freed handle got applied.
+    mlx.fault.arm(1);
+    const again = try ensurePreworkCfg(k1, 128, 128);
+    try std.testing.expect(!mlx.fault.didFire());
+    mlx.fault.disarm();
+    try std.testing.expect(again.ctx == installed.ctx);
+
+    // Same discipline for the norm-gate cache.
+    const nk1 = GdnNormGateCfgKey{ .hv = 8, .seq = 1, .batch = 1, .zs = 8 * 128, .zo = 0, .swish = true };
+    const nk2 = GdnNormGateCfgKey{ .hv = 8, .seq = 2, .batch = 1, .zs = 8 * 128, .zo = 0, .swish = true };
+    const n_installed = try ensureNormGateCfg(nk1, 128);
+    mlx.fault.arm(1);
+    try std.testing.expectError(error.MlxError, ensureNormGateCfg(nk2, 128));
+    try std.testing.expect(mlx.fault.didFire());
+    mlx.fault.disarm();
+    try std.testing.expect(gdn_normgate_cfg.?.ctx == n_installed.ctx);
+    try std.testing.expect(std.meta.eql(gdn_normgate_cfg_key, nk1));
+    mlx.fault.arm(1);
+    const n_again = try ensureNormGateCfg(nk1, 128);
+    try std.testing.expect(!mlx.fault.didFire());
+    mlx.fault.disarm();
+    try std.testing.expect(n_again.ctx == n_installed.ctx);
+}
+
+/// The cache a config release targets: the `if (SLOT) |c| ... free(c)` condition
+/// names it, unless that condition is a null TEST (`if (slot.cfg.ctx != null)
+/// ... free(slot.cfg)`), in which case the freed expression does.
+fn cfgCacheSlot(line: []const u8) ?[]const u8 {
+    const marker = "mlx_fast_metal_kernel_config_free(";
+    const at = std.mem.indexOf(u8, line, marker) orelse return null;
+    const rest = line[at + marker.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+    const arg = std.mem.trim(u8, rest[0..close], " \t");
+    if (std.mem.indexOf(u8, line, "if (")) |ip| {
+        if (ip < at) {
+            const cond_rest = line[ip + 4 ..];
+            if (std.mem.indexOfScalar(u8, cond_rest, ')')) |cp| {
+                const cond = std.mem.trim(u8, cond_rest[0..cp], " \t");
+                if (cond.len > 0 and std.mem.indexOf(u8, cond, "null") == null) return cond;
+            }
+        }
+    }
+    return arg;
+}
+
+/// True when `line` stores into `slot` (and is not itself another release).
+fn assignsToSlot(line: []const u8, slot: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, slot)) return false;
+    const after = line[slot.len..];
+    if (after.len == 0) return false;
+    if (after[0] != ' ' and after[0] != '[' and after[0] != '.' and after[0] != '=') return false;
+    return std.mem.indexOfScalar(u8, line, '=') != null and
+        std.mem.indexOf(u8, line, "mlx_fast_metal_kernel_config_free") == null;
+}
+
+/// `try` as a TOKEN — `entry`/`retry` must not count.
+fn hasTryToken(line: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, line, i, "try")) |p| {
+        const end = p + 3;
+        const before_ok = p == 0 or !(std.ascii.isAlphanumeric(line[p - 1]) or line[p - 1] == '_');
+        const after_ok = end >= line.len or !(std.ascii.isAlphanumeric(line[end]) or line[end] == '_');
+        if (before_ok and after_ok) return true;
+        i = p + 1;
+    }
+    return false;
+}
+
+// Scan guard for the free-then-build class (`CLAUDE.md`: "a fallible re-init
+// BEHIND a `deinit` leaves a freed object on the error path — build first, then
+// swap"). Fourteen module-level fused-kernel config caches released their
+// previous handle BEFORE the replacement's build, so a mid-build `mlx.check`
+// failure left a freed handle cached behind a matching key: the next call
+// applied it (same key) or freed it a second time (different key). The caches
+// are inlined in large forward functions and share no builder entry point, so
+// the invariant is pinned by scanning this source (the repo's "scan-pinned"
+// form) rather than by re-driving fourteen hand-built tensor contexts — several
+// of which would need quantized weights. Hermetic: no device, no stream.
+test "fused-kernel config caches are built BEFORE the previous handle is released" {
+    const src: []const u8 = @embedFile("transformer.zig");
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    var eager_builds: usize = 0;
+    var mid_build_trys: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (std.mem.indexOf(u8, line, "mlx_fast_metal_kernel_config_free") == null) continue;
+        const t = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, t, "defer ") or std.mem.startsWith(u8, t, "errdefer ")) continue;
+        if (std.mem.startsWith(u8, t, "//")) continue;
+
+        // Rule 1 — the pre-fix shape itself: a release immediately followed by a
+        // fresh build of the very handle it just dropped.
+        var probe = lines;
+        while (probe.next()) |nl| {
+            const nt = std.mem.trimStart(u8, nl, " \t");
+            if (nt.len == 0 or std.mem.startsWith(u8, nt, "//")) continue;
+            if (std.mem.indexOf(u8, nt, "mlx_fast_metal_kernel_config_new()") != null) {
+                eager_builds += 1;
+                std.debug.print("  src/transformer.zig:{d}: a build follows the release of the cached handle\n", .{line_no});
+            }
+            break;
+        }
+
+        // Rule 2 — the general shape: nothing fallible may run between a release
+        // and the store that replaces it. A release whose swap this scan cannot
+        // name (a compound store, a loop-local alias) is left to Rule 1.
+        const slot = cfgCacheSlot(line) orelse continue;
+        var probe2 = lines;
+        var steps: usize = 0;
+        var swap_at: ?usize = null;
+        var try_at: ?usize = null;
+        while (probe2.next()) |nl| {
+            steps += 1;
+            if (steps > 200) break;
+            const nt = std.mem.trimStart(u8, nl, " \t");
+            if (std.mem.startsWith(u8, nt, "//")) continue;
+            if (assignsToSlot(nt, slot)) {
+                swap_at = steps;
+                break;
+            }
+            if (try_at == null and hasTryToken(nt)) try_at = steps;
+        }
+        if (swap_at != null and try_at != null and try_at.? < swap_at.?) {
+            mid_build_trys += 1;
+            std.debug.print("  src/transformer.zig:{d}: slot '{s}' has a fallible call before its swap\n", .{ line_no, slot });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), eager_builds + mid_build_trys);
 }
 
 test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {

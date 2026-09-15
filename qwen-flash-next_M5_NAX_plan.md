@@ -18,7 +18,12 @@ numbers are the baseline you compare against, not a target.
   hyper-connection read/write, QSA indexer, PLE key/value, shared expert, MTP head fc) already ride the
   `verifyQmm` lanes (split-K, wide tile, NAX m16 on G17). The experts go through `gather_qmm` /
   `gatherQmv` and have NO verify-width or NAX lane.
-- `MtpCostProfile` for qwen4 resolves to `.generic` (cap 6) on every machine: no calibrated M5 row.
+- `MtpCostProfile` for qwen4 has its own calibrated G17 surface since 2026-08-27/28 (item 1,
+  landed — see below). It resolves only for the exact geometry it was measured on: affine 4-bit
+  at **gs 64** with both head fc packs at that width. Any other pack — including a 4-bit **gs 32**
+  qwen4 trunk — falls back to `.generic`, whose cost surface is a dense 27B GDN refit, i.e. it
+  under-predicts a routed-expert verify row by 3-5x. Check which one is live before reading any
+  MTP number off a box: `[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged` in the boot log.
 
 ## What the 27B NAX lane taught us (do not skip)
 
@@ -65,27 +70,70 @@ numbers are the baseline you compare against, not a target.
    Same box, same pack, same flags, one boot per arm, or the comparison is worthless. A cell that
    moved by less than the spread of its three samples is noise, not a win.
 
-### 1. Calibrated MTP cost profile for qwen4 on G17 (small, high value)
-- `src/mtp.zig` `m5NaxCostProfileForFingerprint` / `MtpCostProfile`: add a qwen4 surface
-  (4-bit gs64 experts, 8-bit dense, in-checkpoint head). Seed the EV cost rows from measured rounds:
-  `MLX_SERVE_MTP_FORCE_DEPTH=n` for n = 1..4 at code/prose/8.5k, `acc_idx=` on `[mtp-trace]`,
-  round ms from `[spec-stats]`. Also the live round-cost table (`~/.mlx-serve/round-cost/<key>.txt`)
-  after a warm run is the honest source.
-- M4 twin (2026-08-27, `docs/gotchas/engine-mlx.md`): the controller is NOT the lever there — auto ≈
-  fixed-2 on prose/8.5k, the round cost is (a depth-2 round = 2.05 serial forwards). On G17 the
-  question is whether the NAX dense lane changes that ratio; measure S=1/2/4 first, calibrate the
-  row only if the ratio moves. Then re-ask default-on (`nativeMoeMtpHeadMeasured`).
+### 1. Calibrated MTP cost profile for qwen4 on G17 — LANDED (do not redo)
+Landed 2026-08-27/28, on this branch. What exists:
+- `MtpCostProfile.g17_nax_qwen4_q4_gs64` — `src/mtp.zig:117`; the pure classifier
+  `qwen4G17CostProfileForFingerprint` (`:169-180`, affine-4 + gs-64 + both head fc packs + a live
+  NAX probe, else `.generic`); the live resolver `qwen4G17CostProfile` (`:206-226`); dispatch
+  `MtpHeadRef.costProfile` (`src/generate.zig:381-386`).
+- The EV surface `MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS` (`src/generate.zig:7524`) and its refit
+  ledger (`:7498-7523`): M5 Max 40-core, 8.5k context, forced-depth saturated echo, depths
+  {1,2,3,4,6} x two reversed passes x 3 reps — T(1)=25.41, T(2)=31.18, T(3)=35.70, T(4)=41.33,
+  T(6)=53.58 ms over a 20.34 ms floor, composite marginals .257/.303. Wired at `:8293-8305`.
+- The depth cap: `mtpDepthCapResolved` (`:7689-7708`) keeps this profile on
+  `MTP_ADAPTIVE_DEFAULT_CAP` with its own written reason — depths 7-8 price at .345/pos against
+  sub-60% tail acceptance, so there is no NAX region to reach. `adaptiveDepthCapForMachine` is NOT
+  consulted for this profile (it only serves `.generic`).
+- Tests: `src/mtp.zig:3641-3646`, `src/generate.zig:13775-13777`, `:13966-14021`.
+
+So the plan's premise ("resolves to `.generic` on every machine") is stale. What is left here is
+MEASUREMENT on the box, not code:
+- Which profile is actually live for the pack under test. A 4-bit **gs 32** trunk resolves to
+  `.generic` by design and inherits the dense-27B surface; that is a deliberate safety fallback
+  ("off-profile geometry remains correct under generic", `src/mtp.zig:495`), not a bug — but it
+  means a gs-32 pack needs its OWN measured row before its MTP numbers mean anything.
+- Re-run S=1/2/4 forwards (`MLX_SERVE_DECODE_FWD_UBENCH*`) and compare against the marginals above.
+  The controller is not the lever (the M4 twin in `docs/gotchas/engine-mlx.md`): a depth-2 round is
+  2.05 serial forwards there. If the G17 ratio differs, refit the row; if it does not, leave it.
+- Only after that, re-ask default-on (`Transformer.nativeMoeMtpHeadMeasured`,
+  `src/transformer.zig:17729` — still a `return false` stub).
 
 ### 2. NAX-tiled grouped expert matmul for verify widths (the real lever)
-Target shape: after routing, a verify of S rows x top-8 gives S*8 (row, expert) pairs; sort by expert
+Target shape: after routing, a verify of S rows x top-K gives S*K (row, expert) pairs; sort by expert
 (`moeMLP2` already does the global sort for `B*S > 1`), so each expert sees a contiguous group of
 1..S rows. Today that is `gather_qmm` sorted (`gatherExpertMm`) at S >= 2, `gatherQmv` at S == 1.
 
-- New kernel beside `gatherQmvGateUpSource` / `gatherQmvDownReduceSource`: per expert group, an m16 NAX
+**Step 0 — the cheap arm, BEFORE any new kernel (landed, opt-in, unmeasured).** The fused rows
+kernels (`gatherQmvGateUpRows` / `gatherQmvDownReduceRows`) are already a validated lane: no
+`gather_qmm`, in-place bank reads, bit-identical per row to the solo single-row call, hermetic tests,
+and the batched-decode shape already ships them. The verify shape is the SAME grouped (token,
+expert) layout — one token's top-K per row — so the only thing keeping verify widths off it was the
+`S == 1` guard in the one dispatch point, `moeDecodeDispatchArm` (`src/transformer.zig:35852`), which
+an existing test pinned. `MLX_SERVE_MOE_VERIFY_ROWS=1` now lets B == 1, 2 <= S <= 8 reach it;
+default OFF, `[moe] verify-width rows arm engaged: S=.. rows=.. topk=..` names the arm.
+
+Run this FIRST, same boot, 3 reps, vs the sorted chain: MTP code/prose/8.5k with the lane on/off.
+- If it wins => the sorted chain's `gather_qmm` addressing penalty was the cost, and the NAX tile
+  below is a second-order refinement. Re-run the 2/4-stream aggregate too (same grouped shape).
+- If it is flat or negative => record the number in `docs/gotchas/engine-mlx.md` and treat the NAX
+  tile as unpromising: its premise was that the routed bank read is what a verify row pays for.
+  Note the prior: the M4 side measured a per-ROW `gatherQmv` loop flat at S=2 / -11% at S=4
+  (item 3), and three MoE fusions measured null on M4. The rows kernel is a different pattern at a
+  different row origin, so it is worth one boot — but no more than one before demanding a signal.
+
+- Then, only if step 0 moved things: new kernel beside `gatherQmvGateUpSource` / `gatherQmvDownReduceSource`:
+  per expert group, an m16 NAX
   tile over the group's rows (pad to the tile; groups of 1-3 rows waste most of the tile, so the win
   is NOT guaranteed; measure). Gate+up fused like `gatherQmvGateUp`, down+reduce like
   `gatherQmvDownReduce`. Codegen with NAMED scalars (the M=8 plain-SIMD cliff and the "per-token
   template value = fresh JIT per value" trap both apply); `ShapeKey` cache keyed on FULL shape.
+  A concrete design note for whoever builds it: the group's activation rows are CONTIGUOUS in the
+  sorted pair order, so the NAX A-operand is the existing `x_rep` at row offset `g_start` (no gather
+  needed); the run descriptor (start / length / expert) is derivable in-kernel from `sorted_inds`
+  (a run starts where the expert changes), which avoids a data-dependent grid and any host sync —
+  grid.x = total_inds, non-start threadgroups exit. Rows past the run must be masked on the STORE
+  (`r < g_len`), and the activation buffer needs `BM-1 = 15` rows of tail padding so the last group's
+  read cannot fault.
 - Eligibility = the kernel's own conditions (4-bit affine gs64 first; q8 needs its own unpack arm,
   never let a templated `else` inherit q6), `K % 256 == 0`, `N % 32 == 0`, NAX probe live.
   Kill switch `MLX_SERVE_MOE_VERIFY_NAX=0`, default OFF until measured. One-shot
